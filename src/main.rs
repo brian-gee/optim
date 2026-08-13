@@ -3,6 +3,7 @@
 mod calc;
 mod config;
 mod font;
+mod watch;
 mod frecency;
 mod index;
 mod matcher;

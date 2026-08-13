@@ -155,12 +155,14 @@ const COMMANDS: [(&str, &str, Action); 10] = [
     ("Sign Out", "sign out log off logoff system", Action::SignOut),
 ];
 
-/// A result row: an installed app, a built-in command, or the `>` terminal runner.
+/// A result row: an installed app, a built-in command, the `>` terminal
+/// runner, or a pasted video URL for the shared mpv window.
 #[derive(Clone, Copy)]
 enum Hit {
     App(usize),
     Cmd(usize),
     Term,
+    Watch,
 }
 
 // Logical layout (scaled by DPI at render time).
@@ -467,6 +469,18 @@ impl App {
     fn update_matches(&mut self) {
         self.matches.clear();
         self.sel = 0;
+        // Pasted URL: one row — play it in the shared mpv window.
+        let q_trim = self.query.trim();
+        if (q_trim.starts_with("https://") || q_trim.starts_with("http://"))
+            && !q_trim.contains(char::is_whitespace)
+            && q_trim.len() > 10
+        {
+            self.calc = None;
+            self.matches.push(Hit::Watch);
+            self.apply_size();
+            self.render();
+            return;
+        }
         // `>` prefix: everything after it is a shell command, nothing else matches.
         if self.query.trim_start().starts_with('>') {
             self.calc = None;
@@ -885,6 +899,26 @@ impl App {
                 } else {
                     let term_name: String;
                     let name: &str = match self.matches[row - calc_rows] {
+                        Hit::Watch => {
+                            let glyph: Vec<u16> = "\u{25B8}".encode_utf16().collect(); // ▸
+                            gfx.rt.DrawText(
+                                &glyph,
+                                &gfx.row_fmt,
+                                &D2D_RECT_F { left: pad + 4.0 * scale, ..text_rect },
+                                &gfx.dim,
+                                Default::default(),
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                            let url = self.query.trim();
+                            let short: String = url
+                                .trim_start_matches("https://")
+                                .trim_start_matches("http://")
+                                .chars()
+                                .take(48)
+                                .collect();
+                            term_name = format!("watch in mpv \u{b7} {short}\u{2026}");
+                            &term_name
+                        }
                         Hit::Term => {
                             let glyph: Vec<u16> = "\u{203A}".encode_utf16().collect(); // ›
                             gfx.rt.DrawText(
@@ -1090,6 +1124,10 @@ impl App {
                         }
                         Some(&Hit::Term) => {
                             self.run_in_terminal(admin);
+                            self.hide();
+                        }
+                        Some(&Hit::Watch) => {
+                            crate::watch::play(self.query.trim());
                             self.hide();
                         }
                         None => {}
