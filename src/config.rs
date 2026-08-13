@@ -10,6 +10,8 @@ pub struct Config {
     pub hotkey_vk: u32,
     pub width: f32,
     pub max_rows: usize,
+    /// Result-row font size in logical px; the input line scales with it.
+    pub font_size: f32,
     /// Editor executable for "Open Config"; empty = system default for .ini.
     pub editor: String,
 }
@@ -24,8 +26,9 @@ impl Default for Config {
             font: "iosevka".into(),
             hotkey_mods: 0x0001, // MOD_ALT
             hotkey_vk: 0x44,     // 'D'
-            width: 640.0,
+            width: 600.0,
             max_rows: 8,
+            font_size: 15.0,
             editor: String::new(),
         }
     }
@@ -69,8 +72,11 @@ font = iosevka
 hotkey = alt+d
 
 # window width (logical px) and max visible result rows
-width = 640
+width = 600
 max_rows = 8
+
+# result-row font size (logical px); input line and row heights scale with it
+font_size = 15
 
 # editor for the Open Config command; empty = system default for .ini
 # e.g.  editor = C:\\Program Files\\Sublime Text\\sublime_text.exe
@@ -137,6 +143,11 @@ pub fn load() -> Config {
             "max_rows" => {
                 if let Ok(n) = v.parse::<usize>() {
                     c.max_rows = n.clamp(1, 16);
+                }
+            }
+            "font_size" => {
+                if let Ok(s) = v.parse::<f32>() {
+                    c.font_size = s.clamp(8.0, 32.0);
                 }
             }
             _ => {}

@@ -31,8 +31,8 @@ tweak one.
 ## Config
 
 `%APPDATA%\optim\config.ini` — theme, color overrides (hex), font family,
-hotkey, window width, max rows, editor. Edit, save, type `reload` in optim.
-The file is created with commented defaults on first run.
+font size, hotkey, window width, max rows, editor. Edit, save, type `reload`
+in optim. The file is created with commented defaults on first run.
 
 Note: the default Alt+D hotkey shadows the browser "focus address bar"
 shortcut system-wide. Rebind in the config (e.g. `hotkey = alt+space`) if

@@ -382,13 +382,18 @@ impl App {
         v * self.scale
     }
 
+    /// Layout multiplier from the configured font size (1.0 at the 15px default).
+    fn fs(&self) -> f32 {
+        self.cfg.font_size / ROW_FONT
+    }
+
     fn total_rows(&self) -> usize {
         self.matches.len() + self.calc.is_some() as usize
     }
 
     fn desired_size(&self) -> (i32, i32) {
         let rows = self.total_rows();
-        let mut h = INPUT_H + rows as f32 * ROW_H;
+        let mut h = (INPUT_H + rows as f32 * ROW_H) * self.fs();
         if rows > 0 {
             h += BOTTOM_PAD;
         }
@@ -569,7 +574,7 @@ impl App {
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    self.px(INPUT_FONT),
+                    self.px(INPUT_FONT * self.fs()),
                     w!("en-us"),
                 )?;
                 input_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -579,7 +584,7 @@ impl App {
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    self.px(ROW_FONT),
+                    self.px(ROW_FONT * self.fs()),
                     w!("en-us"),
                 )?;
                 row_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -635,11 +640,11 @@ impl App {
         let query_utf16: Vec<u16> = self.query.encode_utf16().collect();
         let caret_utf16: Vec<u16> = self.query[..self.caret].encode_utf16().collect();
         let pad = self.px(PAD);
-        let input_h = self.px(INPUT_H);
-        let row_h = self.px(ROW_H);
-        let font_h = self.px(INPUT_FONT) * 1.3;
+        let input_h = self.px(INPUT_H * self.fs());
+        let row_h = self.px(ROW_H * self.fs());
+        let font_h = self.px(INPUT_FONT * self.fs()) * 1.3;
         let scale = self.scale;
-        let icon_edge = 20.0 * scale;
+        let icon_edge = 20.0 * scale * self.fs();
         let text_left = pad + icon_edge + 12.0 * scale; // rows indent past the icon slot
 
         unsafe {
