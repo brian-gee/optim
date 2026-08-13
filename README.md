@@ -14,9 +14,10 @@ no plugins — a single exe that idles around 11 MB.
 - `>ipconfig` runs a shell command in Windows Terminal (falls back to cmd)
 - Ships with [Iosevka](https://typeof.net/Iosevka/) (SIL OFL) as the default
   font — or set any installed family via `font =`
-- **Game mode**: won't pop over fullscreen apps (`game_mode = auto`); press the
-  hotkey 3× within 2s to override. `optim: Game Mode` (or the tray menu) forces
-  blocking everywhere until toggled off.
+- **Game mode**: won't pop over a focused fullscreen app (`game_mode = auto`,
+  per-monitor aware). `optim: Game Mode` (or the tray menu) forces blocking
+  everywhere. Pressing the hotkey 3× within 2s always opens the window — and
+  switches forced mode back off.
 - Ctrl+A selects the query; typing replaces it
 - Index refreshes itself when apps are installed or removed — it never goes stale
 - Tray icon → Open Config / Reload Config / Refresh Apps / Game Mode / Exit

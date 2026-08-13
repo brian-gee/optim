@@ -31,13 +31,41 @@ fn shutdown_exe(args: PCWSTR) {
     }
 }
 
-/// True while the foreground app is fullscreen (game, video, presentation).
+/// True while the focused window is fullscreen on its own monitor.
+/// Geometric and per-window, so a game fullscreen on one monitor doesn't
+/// block the popup while you're focused on another, and system DND state
+/// can't cause false positives.
 fn fullscreen_app_active() -> bool {
-    use windows::Win32::UI::Shell::SHQueryUserNotificationState;
+    use windows::Win32::Graphics::Gdi::MonitorFromWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowRect,
+    };
     unsafe {
-        // 2 = busy (borderless fullscreen), 3 = D3D exclusive fullscreen,
-        // 4 = presentation mode, 7 = fullscreen store app.
-        matches!(SHQueryUserNotificationState(), Ok(s) if [2, 3, 4, 7].contains(&s.0))
+        let fg = GetForegroundWindow();
+        if fg == HWND::default() {
+            return false;
+        }
+        // The desktop and shell surfaces are monitor-sized but aren't games.
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(fg, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if matches!(class.as_str(), "WorkerW" | "Progman" | "Shell_TrayWnd") {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(fg, &mut rect).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
     }
 }
 use windows::Win32::UI::Shell::{
@@ -573,8 +601,9 @@ impl App {
         unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
     }
 
-    /// Game-mode gate. Three presses inside two seconds always win — that's
-    /// the escape hatch out of both automatic and forced blocking.
+    /// Game-mode gate. Three presses inside two seconds always open the
+    /// window — and if forced game mode was on, the spam also turns it off,
+    /// reverting to the normal fullscreen-only behavior.
     fn hotkey_show_allowed(&mut self) -> bool {
         let now = Instant::now();
         self.hotkey_presses
@@ -582,6 +611,7 @@ impl App {
         self.hotkey_presses.push(now);
         if self.hotkey_presses.len() >= 3 {
             self.hotkey_presses.clear();
+            self.forced_game_mode = false;
             return true;
         }
         if self.forced_game_mode {
