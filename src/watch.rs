@@ -40,24 +40,118 @@ fn mpv_exe() -> std::path::PathBuf {
     }
 }
 
-/// Play the URL in the shared window, starting mpv if needed.
-pub fn play(url: &str) {
-    if send_ipc(url).is_ok() {
+const KEEP_HOURS: u64 = 24;
+
+fn temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("watchqueue")
+}
+
+/// Delete downloads older than KEEP_HOURS so temp stays temp.
+fn prune_old() {
+    let Ok(entries) = std::fs::read_dir(temp_dir()) else { return };
+    for e in entries.flatten() {
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age.as_secs() > KEEP_HOURS * 3600)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Filename for a URL: honors `download_filename=` (common on file hosts),
+/// else the last path segment, else a timestamp. Always sanitized.
+fn dest_for(url: &str) -> std::path::PathBuf {
+    let from_param = url
+        .split("download_filename=")
+        .nth(1)
+        .and_then(|rest| rest.split(['&', '/']).next())
+        .filter(|s| !s.is_empty());
+    let from_path = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|p| p.trim_end_matches('/').rsplit('/').next())
+        .filter(|s| s.contains('.') && s.len() > 4);
+    let raw = from_param.or(from_path).unwrap_or("video.mp4");
+    let mut name: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() || "-_. ".contains(c) { c } else { '_' })
+        .take(80)
+        .collect();
+    if !name.contains('.') {
+        name.push_str(".mp4");
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    temp_dir().join(format!("{stamp}-{name}"))
+}
+
+/// True if curl finished and left a plausible file behind.
+fn download(url: &str, dest: &std::path::Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = std::process::Command::new("curl.exe")
+        .args(["-L", "-s", "--retry", "5", "--retry-delay", "2", "-C", "-", "-o"])
+        .arg(dest)
+        .arg(url)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+    status.map(|s| s.success()).unwrap_or(false)
+        && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
+}
+
+fn open_in_shared_window(target: &str) {
+    if send_ipc(target).is_ok() {
         return;
     }
     let _ = std::process::Command::new(mpv_exe())
         .arg("--force-window=yes")
-        .arg(url)
+        .arg(target)
         .spawn();
+}
+
+/// Download the URL to temp (scrubbable, survives dead links), then open it
+/// as a tab in the shared window. Falls back to direct streaming when the
+/// download fails (e.g. streaming sites that need yt-dlp). Runs on a
+/// background thread — optim is resident, so the download outlives the popup.
+pub fn play(url: &str) {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(temp_dir());
+        prune_old();
+        let dest = dest_for(&url);
+        if download(&url, &dest) {
+            open_in_shared_window(&dest.to_string_lossy());
+        } else {
+            let _ = std::fs::remove_file(&dest);
+            open_in_shared_window(&url);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::json_escape;
+    use super::{dest_for, json_escape};
 
     #[test]
     fn escaping() {
         assert_eq!(json_escape("plain"), "\"plain\"");
         assert_eq!(json_escape("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn dest_names() {
+        let d = dest_for("https://host/get_file/1/abc/1.mp4/?download_filename=cool.mp4&download=true");
+        assert!(d.file_name().unwrap().to_string_lossy().ends_with("-cool.mp4"));
+        let d = dest_for("https://host/path/clip.webm?token=x");
+        assert!(d.file_name().unwrap().to_string_lossy().ends_with("-clip.webm"));
+        let d = dest_for("https://host/watch?v=abc123");
+        assert!(d.file_name().unwrap().to_string_lossy().ends_with(".mp4"));
     }
 }

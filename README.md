@@ -13,9 +13,11 @@ no plugins — a single exe that idles around 11 MB.
   `optim: Open Config`, `optim: Reload Config`, `optim: Refresh Apps`, `optim: Quit`
 - System commands: `Restart`, `Shut Down`, `Sleep`, `Lock`, `Sign Out`
 - `>ipconfig` runs a shell command in Windows Terminal (falls back to cmd)
-- Paste a video URL → **watch in mpv**: every URL appends to one shared mpv
-  window as a playlist "tab" (Ctrl+TAB switches, `D` detaches to its own
-  window — keybinds via an mpv script; see the wiki note in the repo)
+- Paste a video URL → **watch in mpv**: the file downloads to `%TEMP%\watchqueue`
+  in the background (scrubbable, survives expiring links; pruned after 24 h)
+  and appends to one shared mpv window as a playlist "tab". Streaming sites
+  fall back to direct playback via yt-dlp. Tab keybinds come from an mpv
+  user script (TAB menu, Ctrl+TAB cycle, `D` detach).
 - Ships with [Iosevka](https://typeof.net/Iosevka/) (SIL OFL) as the default
   font — or set any installed family via `font =`
 - **Game mode**: won't pop over a focused fullscreen app (`game_mode = auto`,
