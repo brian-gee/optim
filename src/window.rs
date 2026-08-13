@@ -9,7 +9,8 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+    D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -629,6 +630,9 @@ impl App {
                 let (w, h) = self.desired_size();
                 let rt = self.d2d_factory.CreateHwndRenderTarget(
                     &D2D1_RENDER_TARGET_PROPERTIES {
+                        // WARP instead of the NVIDIA D3D device: saves ~50 MB private
+                        // bytes and a 600px popup rasterizes fast enough on CPU
+                        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                         dpiX: 96.0, // render in raw pixels; we scale manually
                         dpiY: 96.0,
                         ..Default::default()
