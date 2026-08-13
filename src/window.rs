@@ -20,7 +20,16 @@ use crate::index::{launch, AppEntry, ICON_SIZE};
 use crate::matcher;
 use std::collections::HashMap;
 use std::time::Instant;
+use windows::Win32::System::Power::SetSuspendState;
+use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{UnregisterHotKey, HOT_KEY_MODIFIERS};
+
+/// Fire-and-forget `shutdown.exe` with the given switches.
+fn shutdown_exe(args: PCWSTR) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), w!("shutdown.exe"), args, None, SW_SHOWNORMAL);
+    }
+}
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
@@ -83,22 +92,33 @@ enum Action {
     ReloadConfig,
     RefreshApps,
     Quit,
+    Restart,
+    Shutdown,
+    Sleep,
+    Lock,
+    SignOut,
 }
 
 /// Typed commands: (display name, extra match keywords, action).
-/// Keywords let "exit"/"settings" find their commands too.
-const COMMANDS: [(&str, &str, Action); 4] = [
-    ("Open Config", "open config settings edit", Action::OpenConfig),
-    ("Reload Config", "reload config settings", Action::ReloadConfig),
-    ("Refresh Apps", "refresh apps index rescan", Action::RefreshApps),
-    ("Quit optim", "quit exit optim close", Action::Quit),
+/// Keywords let "exit"/"settings"/"reboot" find their commands too.
+const COMMANDS: [(&str, &str, Action); 9] = [
+    ("optim: Open Config", "optim open config settings edit", Action::OpenConfig),
+    ("optim: Reload Config", "optim reload config settings", Action::ReloadConfig),
+    ("optim: Refresh Apps", "optim refresh apps index rescan", Action::RefreshApps),
+    ("optim: Quit", "optim quit exit close", Action::Quit),
+    ("Restart", "restart reboot system power", Action::Restart),
+    ("Shut Down", "shut down shutdown power off system", Action::Shutdown),
+    ("Sleep", "sleep suspend system power", Action::Sleep),
+    ("Lock", "lock workstation system", Action::Lock),
+    ("Sign Out", "sign out log off logoff system", Action::SignOut),
 ];
 
-/// A result row: an installed app or a built-in command.
+/// A result row: an installed app, a built-in command, or the `>` terminal runner.
 #[derive(Clone, Copy)]
 enum Hit {
     App(usize),
     Cmd(usize),
+    Term,
 }
 
 // Logical layout (scaled by DPI at render time).
@@ -145,6 +165,8 @@ pub struct App {
     cfg: Config,
     frec: HashMap<String, u32>,
     last_index: Instant,
+    /// Private collection holding the bundled Iosevka; None → system fonts only.
+    iosevka: Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection>,
 }
 
 impl App {
@@ -164,6 +186,7 @@ impl App {
             let d2d_factory: ID2D1Factory =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let iosevka = crate::font::iosevka_collection(&dwrite);
 
             let mut app = Box::new(App {
                 hwnd: HWND::default(),
@@ -180,6 +203,7 @@ impl App {
                 cfg: config::load(),
                 frec: frecency::load(),
                 last_index: Instant::now(),
+                iosevka,
             });
 
             let hwnd = CreateWindowExW(
@@ -326,6 +350,15 @@ impl App {
                 Action::Quit => {
                     let _ = DestroyWindow(self.hwnd);
                 }
+                Action::Restart => shutdown_exe(w!("/r /t 0")),
+                Action::Shutdown => shutdown_exe(w!("/s /t 0")),
+                Action::SignOut => shutdown_exe(w!("/l")),
+                Action::Sleep => {
+                    let _ = SetSuspendState(false, false, false);
+                }
+                Action::Lock => {
+                    let _ = LockWorkStation();
+                }
             }
         }
     }
@@ -365,6 +398,16 @@ impl App {
     fn update_matches(&mut self) {
         self.matches.clear();
         self.sel = 0;
+        // `>` prefix: everything after it is a shell command, nothing else matches.
+        if self.query.trim_start().starts_with('>') {
+            self.calc = None;
+            if !self.terminal_command().is_empty() {
+                self.matches.push(Hit::Term);
+            }
+            self.apply_size();
+            self.invalidate();
+            return;
+        }
         self.calc = calc::eval(self.query.trim()).map(calc::format);
         let q = self.query.trim().to_lowercase();
         if !q.is_empty() {
@@ -388,6 +431,39 @@ impl App {
         }
         self.apply_size();
         self.invalidate();
+    }
+
+    /// The command text after a `>` prefix, trimmed.
+    fn terminal_command(&self) -> &str {
+        self.query.trim_start().strip_prefix('>').unwrap_or("").trim()
+    }
+
+    fn run_in_terminal(&self) {
+        unsafe {
+            let args = format!("cmd /k {}", self.terminal_command());
+            let args16: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+            let h = ShellExecuteW(
+                None,
+                w!("open"),
+                w!("wt.exe"),
+                PCWSTR(args16.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            );
+            if h.0 as isize <= 32 {
+                // No Windows Terminal — plain cmd window.
+                let args = format!("/k {}", self.terminal_command());
+                let args16: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    w!("cmd.exe"),
+                    PCWSTR(args16.as_ptr()),
+                    None,
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
     }
 
     fn apply_size(&self) {
@@ -469,16 +545,27 @@ impl App {
                 let fg = rt.CreateSolidColorBrush(&col(self.cfg.fg), None)?;
                 let dim = rt.CreateSolidColorBrush(&col(self.cfg.dim), None)?;
                 let sel = rt.CreateSolidColorBrush(&col(self.cfg.sel), None)?;
-                let font16: Vec<u16> = self
-                    .cfg
-                    .font
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
+                // "iosevka" (or empty) = the bundled font from our private
+                // collection; anything else = an installed family by name.
+                let use_bundled = (self.cfg.font.is_empty()
+                    || self.cfg.font.eq_ignore_ascii_case("iosevka"))
+                    && self.iosevka.is_some();
+                let family = if use_bundled {
+                    crate::font::IOSEVKA_FAMILY.to_string()
+                } else if self.cfg.font.is_empty()
+                    || self.cfg.font.eq_ignore_ascii_case("iosevka")
+                {
+                    "Segoe UI Variable Text".to_string() // bundled font failed to load
+                } else {
+                    self.cfg.font.clone()
+                };
+                let collection = if use_bundled { self.iosevka.as_ref() } else { None };
+                let font16: Vec<u16> =
+                    family.encode_utf16().chain(std::iter::once(0)).collect();
                 let font = PCWSTR(font16.as_ptr());
                 let input_fmt = self.dwrite.CreateTextFormat(
                     font,
-                    None,
+                    collection,
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
@@ -488,7 +575,7 @@ impl App {
                 input_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 let row_fmt = self.dwrite.CreateTextFormat(
                     font,
-                    None,
+                    collection,
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
@@ -665,7 +752,21 @@ impl App {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
                 } else {
+                    let term_name: String;
                     let name: &str = match self.matches[row - calc_rows] {
+                        Hit::Term => {
+                            let glyph: Vec<u16> = "\u{203A}".encode_utf16().collect(); // ›
+                            gfx.rt.DrawText(
+                                &glyph,
+                                &gfx.row_fmt,
+                                &D2D_RECT_F { left: pad + 4.0 * scale, ..text_rect },
+                                &gfx.dim,
+                                Default::default(),
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                            term_name = format!("run: {}", self.terminal_command());
+                            &term_name
+                        }
                         Hit::App(idx) => {
                             if let Some(bmp) = Self::icon_bitmap(&mut gfx, &self.apps, idx) {
                                 gfx.rt.DrawBitmap(
@@ -822,6 +923,10 @@ impl App {
                         Some(&Hit::Cmd(idx)) => {
                             self.hide();
                             self.run_action(COMMANDS[idx].2);
+                        }
+                        Some(&Hit::Term) => {
+                            self.run_in_terminal();
+                            self.hide();
                         }
                         None => {}
                     }

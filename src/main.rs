@@ -2,6 +2,7 @@
 
 mod calc;
 mod config;
+mod font;
 mod frecency;
 mod index;
 mod matcher;
@@ -57,6 +58,22 @@ fn main() -> Result<()> {
     }
     if std::env::args().any(|a| a == "--uninstall-autostart") {
         return set_autostart(false);
+    }
+    if std::env::args().any(|a| a == "--version") {
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK};
+        let text: Vec<u16> = concat!("optim ", env!("CARGO_PKG_VERSION"))
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            MessageBoxW(
+                None,
+                windows::core::PCWSTR(text.as_ptr()),
+                w!("optim"),
+                MB_OK,
+            );
+        }
+        return Ok(());
     }
     unsafe {
         // Single instance: if optim is already running, tell it to show itself and exit.

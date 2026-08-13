@@ -3,7 +3,10 @@
 /// least one operator (so plain numbers or app names never trigger it).
 
 pub fn eval(input: &str) -> Option<f64> {
-    let s: Vec<char> = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut s: Vec<char> = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.last() == Some(&'=') {
+        s.pop(); // tolerate the "5*5=" typing habit
+    }
     if s.is_empty() || !s.iter().all(|c| "0123456789.+-*/%^()".contains(*c)) {
         return None;
     }
@@ -122,6 +125,12 @@ mod tests {
     fn unary_and_percent() {
         assert_eq!(eval("-3+10"), Some(7.0));
         assert_eq!(eval("10%3"), Some(1.0));
+    }
+
+    #[test]
+    fn trailing_equals() {
+        assert_eq!(eval("5*5="), Some(25.0));
+        assert_eq!(eval("5*5=="), None); // only one, at the end
     }
 
     #[test]
