@@ -416,7 +416,7 @@ impl App {
                 self.matches.push(Hit::Term);
             }
             self.apply_size();
-            self.invalidate();
+            self.render();
             return;
         }
         self.calc = calc::eval(self.query.trim()).map(calc::format);
@@ -441,7 +441,9 @@ impl App {
                 .extend(scored.iter().take(self.cfg.max_rows).map(|&(_, h)| h));
         }
         self.apply_size();
-        self.invalidate();
+        // Resizing clears the D2D backbuffer; paint immediately rather than
+        // waiting for WM_PAINT so typing never flashes an empty frame.
+        self.render();
     }
 
     /// The command text after a `>` prefix, trimmed.
@@ -520,6 +522,10 @@ impl App {
             let x = work.left + ((work.right - work.left) - w) / 2;
             let y = work.top + ((work.bottom - work.top) / 4);
             let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
+
+            // Paint before becoming visible — otherwise the bare frame shows
+            // until the queued WM_PAINT lands.
+            self.render();
 
             let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             let _ = SetForegroundWindow(self.hwnd);
