@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod index;
+mod matcher;
 mod window;
 
 use windows::core::{w, Result};
@@ -17,8 +19,8 @@ use window::{App, WINDOW_CLASS, WM_APP_SHOW};
 
 fn main() -> Result<()> {
     unsafe {
-        // Single instance: if flick is already running, tell it to show itself and exit.
-        let _mutex = CreateMutexW(None, true, w!("flick_single_instance_mutex"))?;
+        // Single instance: if optim is already running, tell it to show itself and exit.
+        let _mutex = CreateMutexW(None, true, w!("optim_single_instance_mutex"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(WINDOW_CLASS, None) {
                 if existing != HWND::default() {
@@ -32,6 +34,9 @@ fn main() -> Result<()> {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
 
         let _app = App::create()?;
+
+        let hwnd_val = _app.hwnd_val();
+        std::thread::spawn(move || index::run_index(hwnd_val));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

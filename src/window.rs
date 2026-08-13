@@ -6,8 +6,11 @@ use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_CO
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
 };
+
+use crate::index::{launch, AppEntry};
+use crate::matcher;
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
@@ -23,21 +26,22 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_CONTROL, VK_DELETE, VK_END,
-    VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SPACE,
+    GetKeyState, RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, LoadCursorW, PostQuitMessage, RegisterClassW,
     SetWindowLongPtrW, GetWindowLongPtrW, SetWindowPos, ShowWindow, SetForegroundWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW,
-    SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA, WM_ACTIVATE, WM_APP, WM_CHAR,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WM_ACTIVATE, WM_APP, WM_CHAR,
     WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_NCCREATE, WM_PAINT,
     WM_SIZE, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-pub const WINDOW_CLASS: PCWSTR = w!("flick_window");
+pub const WINDOW_CLASS: PCWSTR = w!("optim_window");
 pub const WM_APP_SHOW: u32 = WM_APP + 1;
+pub const WM_APP_INDEXED: u32 = WM_APP + 2;
 const HOTKEY_ID: i32 = 1;
 
 // Logical layout (scaled by DPI at render time).
@@ -45,11 +49,16 @@ const WIN_W: f32 = 640.0;
 const PAD: f32 = 18.0;
 const INPUT_H: f32 = 60.0;
 const INPUT_FONT: f32 = 20.0;
+const ROW_H: f32 = 42.0;
+const ROW_FONT: f32 = 15.0;
+const BOTTOM_PAD: f32 = 8.0;
+const MAX_ROWS: usize = 8;
 
 // Palette — near-black, minimal.
 const BG: D2D1_COLOR_F = rgb(0x1B, 0x1B, 0x1D);
 const FG: D2D1_COLOR_F = rgb(0xEC, 0xEC, 0xEE);
 const DIM: D2D1_COLOR_F = rgb(0x77, 0x77, 0x7C);
+const SEL: D2D1_COLOR_F = rgb(0x2C, 0x2C, 0x31);
 
 const fn rgb(r: u8, g: u8, b: u8) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
@@ -59,7 +68,9 @@ struct Gfx {
     rt: ID2D1HwndRenderTarget,
     fg: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
+    sel: ID2D1SolidColorBrush,
     input_fmt: IDWriteTextFormat,
+    row_fmt: IDWriteTextFormat,
 }
 
 pub struct App {
@@ -70,6 +81,9 @@ pub struct App {
     query: String,
     caret: usize, // byte offset into query, always on a char boundary
     scale: f32,
+    apps: Vec<AppEntry>,
+    matches: Vec<usize>, // indices into apps, best first
+    sel: usize,
 }
 
 impl App {
@@ -98,12 +112,15 @@ impl App {
                 query: String::new(),
                 caret: 0,
                 scale: 1.0,
+                apps: Vec::new(),
+                matches: Vec::new(),
+                sel: 0,
             });
 
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 WINDOW_CLASS,
-                w!("flick"),
+                w!("optim"),
                 WS_POPUP,
                 0, 0, 640, 60,
                 None,
@@ -128,19 +145,62 @@ impl App {
         }
     }
 
+    pub fn hwnd_val(&self) -> isize {
+        self.hwnd.0 as isize
+    }
+
     fn px(&self, v: f32) -> f32 {
         v * self.scale
     }
 
     fn desired_size(&self) -> (i32, i32) {
-        // M1: input row only. Results rows come in M2.
-        (self.px(WIN_W) as i32, self.px(INPUT_H) as i32)
+        let rows = self.matches.len();
+        let mut h = INPUT_H + rows as f32 * ROW_H;
+        if rows > 0 {
+            h += BOTTOM_PAD;
+        }
+        (self.px(WIN_W) as i32, self.px(h) as i32)
+    }
+
+    fn update_matches(&mut self) {
+        self.matches.clear();
+        self.sel = 0;
+        let q = self.query.trim().to_lowercase();
+        if !q.is_empty() {
+            let mut scored: Vec<(i32, usize)> = self
+                .apps
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| matcher::score(&q, &a.name_lower).map(|s| (s, i)))
+                .collect();
+            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            self.matches.extend(scored.iter().take(MAX_ROWS).map(|&(_, i)| i));
+        }
+        self.apply_size();
+        self.invalidate();
+    }
+
+    fn apply_size(&self) {
+        unsafe {
+            let (w, h) = self.desired_size();
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                w,
+                h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 
     fn show(&mut self) {
         unsafe {
             self.query.clear();
             self.caret = 0;
+            self.matches.clear();
+            self.sel = 0;
 
             // Place on the monitor holding the cursor, centered, upper third.
             let mut pt = POINT::default();
@@ -189,6 +249,7 @@ impl App {
                 )?;
                 let fg = rt.CreateSolidColorBrush(&FG, None)?;
                 let dim = rt.CreateSolidColorBrush(&DIM, None)?;
+                let sel = rt.CreateSolidColorBrush(&SEL, None)?;
                 let input_fmt = self.dwrite.CreateTextFormat(
                     w!("Segoe UI Variable Text"),
                     None,
@@ -199,7 +260,17 @@ impl App {
                     w!("en-us"),
                 )?;
                 input_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                self.gfx = Some(Gfx { rt, fg, dim, input_fmt });
+                let row_fmt = self.dwrite.CreateTextFormat(
+                    w!("Segoe UI Variable Text"),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    self.px(ROW_FONT),
+                    w!("en-us"),
+                )?;
+                row_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+                self.gfx = Some(Gfx { rt, fg, dim, sel, input_fmt, row_fmt });
             }
         }
         Ok(self.gfx.as_ref().unwrap())
@@ -211,9 +282,16 @@ impl App {
         let caret_utf16: Vec<u16> = self.query[..self.caret].encode_utf16().collect();
         let pad = self.px(PAD);
         let input_h = self.px(INPUT_H);
+        let row_h = self.px(ROW_H);
         let font_h = self.px(INPUT_FONT) * 1.3;
         let scale = self.scale;
         let dwrite = self.dwrite.clone();
+        let rows: Vec<(Vec<u16>, bool)> = self
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| (self.apps[i].name.encode_utf16().collect(), n == self.sel))
+            .collect();
 
         let Ok(gfx) = self.ensure_gfx() else { return };
         unsafe {
@@ -274,7 +352,40 @@ impl App {
                 &gfx.fg,
             );
 
-            let _ = h; // full height used in M2 for result rows
+            // Result rows.
+            let _ = h;
+            for (n, (name16, selected)) in rows.iter().enumerate() {
+                let top = input_h + n as f32 * row_h;
+                if *selected {
+                    gfx.rt.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: pad * 0.5,
+                                top: top + 1.0,
+                                right: w as f32 - pad * 0.5,
+                                bottom: top + row_h - 1.0,
+                            },
+                            radiusX: 6.0 * scale,
+                            radiusY: 6.0 * scale,
+                        },
+                        &gfx.sel,
+                    );
+                }
+                gfx.rt.DrawText(
+                    name16,
+                    &gfx.row_fmt,
+                    &D2D_RECT_F {
+                        left: pad,
+                        top,
+                        right: w as f32 - pad,
+                        bottom: top + row_h,
+                    },
+                    &gfx.fg,
+                    Default::default(),
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+
             if gfx.rt.EndDraw(None, None).is_err() {
                 self.gfx = None; // device lost — recreate next frame
             }
@@ -346,12 +457,30 @@ impl App {
             }
             _ => return,
         }
-        self.invalidate();
+        self.update_matches();
     }
 
     fn on_keydown(&mut self, vk: u16) {
         match vk {
             v if v == VK_ESCAPE.0 => self.hide(),
+            v if v == VK_RETURN.0 => {
+                if let Some(&idx) = self.matches.get(self.sel) {
+                    launch(&self.apps[idx]);
+                    self.hide();
+                }
+            }
+            v if v == VK_UP.0 => {
+                if !self.matches.is_empty() {
+                    self.sel = self.sel.checked_sub(1).unwrap_or(self.matches.len() - 1);
+                    self.invalidate();
+                }
+            }
+            v if v == VK_DOWN.0 => {
+                if !self.matches.is_empty() {
+                    self.sel = (self.sel + 1) % self.matches.len();
+                    self.invalidate();
+                }
+            }
             v if v == VK_LEFT.0 => {
                 self.caret = self.prev_boundary(Self::ctrl_down());
                 self.invalidate();
@@ -371,7 +500,7 @@ impl App {
             v if v == VK_DELETE.0 => {
                 let end = self.next_boundary(Self::ctrl_down());
                 self.query.replace_range(self.caret..end, "");
-                self.invalidate();
+                self.update_matches();
             }
             _ => {}
         }
@@ -390,6 +519,12 @@ impl App {
                 }
                 WM_APP_SHOW => {
                     self.show();
+                    LRESULT(0)
+                }
+                WM_APP_INDEXED => {
+                    let boxed = Box::from_raw(lparam.0 as *mut Vec<AppEntry>);
+                    self.apps = *boxed;
+                    self.update_matches();
                     LRESULT(0)
                 }
                 WM_CHAR => {
