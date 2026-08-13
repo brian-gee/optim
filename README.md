@@ -15,9 +15,12 @@ no plugins — a single exe that idles around 11 MB.
 - `>ipconfig` runs a shell command in Windows Terminal (falls back to cmd)
 - Paste a video URL → **watch in mpv**: the file downloads to `%TEMP%\watchqueue`
   in the background (scrubbable, survives expiring links; pruned after 24 h)
-  and appends to one shared mpv window as a playlist "tab". Streaming sites
-  fall back to direct playback via yt-dlp. Tab keybinds come from an mpv
-  user script (TAB menu, Ctrl+TAB cycle, `D` detach).
+  and appends to one shared mpv window as a playlist "tab" — playback starts
+  as soon as ~1 MB has landed, while the rest downloads behind the scrubber.
+  Streaming sites fall back to direct playback via yt-dlp.
+  [`extras/mpv/tabs.lua`](extras/mpv/tabs.lua) (drop into `%APPDATA%\mpv\scripts`)
+  provides the tab UI: TAB opens a menu with mouse hover/click/right-click-close,
+  Ctrl+TAB or Ctrl+wheel cycles, `D` detaches a tab to its own window.
 - Ships with [Iosevka](https://typeof.net/Iosevka/) (SIL OFL) as the default
   font — or set any installed family via `font =`
 - **Game mode**: won't pop over a focused fullscreen app (`game_mode = auto`,

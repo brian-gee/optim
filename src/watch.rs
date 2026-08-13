@@ -92,18 +92,20 @@ fn dest_for(url: &str) -> std::path::PathBuf {
     temp_dir().join(format!("{stamp}-{name}"))
 }
 
-/// True if curl finished and left a plausible file behind.
-fn download(url: &str, dest: &std::path::Path) -> bool {
+fn start_download(url: &str, dest: &std::path::Path) -> Option<std::process::Child> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let status = std::process::Command::new("curl.exe")
+    std::process::Command::new("curl.exe")
         .args(["-L", "-s", "--retry", "5", "--retry-delay", "2", "-C", "-", "-o"])
         .arg(dest)
         .arg(url)
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
-    status.map(|s| s.success()).unwrap_or(false)
-        && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false)
+        .spawn()
+        .ok()
+}
+
+fn file_len(p: &std::path::Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
 fn open_in_shared_window(target: &str) {
@@ -116,20 +118,44 @@ fn open_in_shared_window(target: &str) {
         .spawn();
 }
 
-/// Download the URL to temp (scrubbable, survives dead links), then open it
-/// as a tab in the shared window. Falls back to direct streaming when the
-/// download fails (e.g. streaming sites that need yt-dlp). Runs on a
-/// background thread — optim is resident, so the download outlives the popup.
+/// Download the URL to temp (scrubbable, survives dead links) and open it
+/// as a tab in the shared window as soon as ~1 MB has landed — mpv plays
+/// the still-growing file while curl finishes behind it. Falls back to
+/// direct streaming when the download fails outright (e.g. streaming sites
+/// that need yt-dlp). Runs on a background thread — optim is resident, so
+/// the download outlives the popup.
 pub fn play(url: &str) {
+    const EARLY_PLAY_BYTES: u64 = 1024 * 1024;
     let url = url.to_string();
     std::thread::spawn(move || {
         let _ = std::fs::create_dir_all(temp_dir());
         prune_old();
         let dest = dest_for(&url);
-        if download(&url, &dest) {
-            open_in_shared_window(&dest.to_string_lossy());
-        } else {
+        let Some(mut child) = start_download(&url, &dest) else {
+            open_in_shared_window(&url); // no curl? stream it
+            return;
+        };
+        let mut opened = false;
+        let exit = loop {
+            let done = child.try_wait().ok().flatten();
+            if !opened && (file_len(&dest) >= EARLY_PLAY_BYTES || done.is_some()) {
+                // Enough header bytes for mpv to start on the growing file
+                // (assumes web-optimized mp4; worst case the tab errors and
+                // plays fine once the download completes).
+                if file_len(&dest) > 0 {
+                    open_in_shared_window(&dest.to_string_lossy());
+                    opened = true;
+                }
+            }
+            if let Some(status) = done {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        if !opened {
+            // Download produced nothing — stream the URL directly instead.
             let _ = std::fs::remove_file(&dest);
+            let _ = exit;
             open_in_shared_window(&url);
         }
     });
