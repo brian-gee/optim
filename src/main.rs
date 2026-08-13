@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod calc;
 mod index;
 mod matcher;
 mod window;

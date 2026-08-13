@@ -9,8 +9,14 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
 };
 
+use crate::calc;
 use crate::index::{launch, AppEntry};
 use crate::matcher;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
@@ -83,6 +89,7 @@ pub struct App {
     scale: f32,
     apps: Vec<AppEntry>,
     matches: Vec<usize>, // indices into apps, best first
+    calc: Option<String>, // formatted result; occupies row 0 when present
     sel: usize,
 }
 
@@ -114,6 +121,7 @@ impl App {
                 scale: 1.0,
                 apps: Vec::new(),
                 matches: Vec::new(),
+                calc: None,
                 sel: 0,
             });
 
@@ -153,8 +161,12 @@ impl App {
         v * self.scale
     }
 
+    fn total_rows(&self) -> usize {
+        self.matches.len() + self.calc.is_some() as usize
+    }
+
     fn desired_size(&self) -> (i32, i32) {
-        let rows = self.matches.len();
+        let rows = self.total_rows();
         let mut h = INPUT_H + rows as f32 * ROW_H;
         if rows > 0 {
             h += BOTTOM_PAD;
@@ -165,6 +177,7 @@ impl App {
     fn update_matches(&mut self) {
         self.matches.clear();
         self.sel = 0;
+        self.calc = calc::eval(self.query.trim()).map(calc::format);
         let q = self.query.trim().to_lowercase();
         if !q.is_empty() {
             let mut scored: Vec<(i32, usize)> = self
@@ -200,6 +213,7 @@ impl App {
             self.query.clear();
             self.caret = 0;
             self.matches.clear();
+            self.calc = None;
             self.sel = 0;
 
             // Place on the monitor holding the cursor, centered, upper third.
@@ -286,12 +300,17 @@ impl App {
         let font_h = self.px(INPUT_FONT) * 1.3;
         let scale = self.scale;
         let dwrite = self.dwrite.clone();
-        let rows: Vec<(Vec<u16>, bool)> = self
-            .matches
-            .iter()
-            .enumerate()
-            .map(|(n, &i)| (self.apps[i].name.encode_utf16().collect(), n == self.sel))
-            .collect();
+        let mut rows: Vec<(Vec<u16>, bool)> = Vec::with_capacity(self.total_rows());
+        if let Some(result) = &self.calc {
+            rows.push((format!("= {result}").encode_utf16().collect(), self.sel == 0));
+        }
+        let calc_rows = self.calc.is_some() as usize;
+        rows.extend(self.matches.iter().enumerate().map(|(n, &i)| {
+            (
+                self.apps[i].name.encode_utf16().collect(),
+                n + calc_rows == self.sel,
+            )
+        }));
 
         let Ok(gfx) = self.ensure_gfx() else { return };
         unsafe {
@@ -398,6 +417,31 @@ impl App {
         }
     }
 
+    fn copy_to_clipboard(&self, text: &str) {
+        unsafe {
+            let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = utf16.len() * 2;
+            if OpenClipboard(Some(self.hwnd)).is_err() {
+                return;
+            }
+            let _ = EmptyClipboard();
+            if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+                let ptr = GlobalLock(hmem);
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
+                    let _ = GlobalUnlock(hmem);
+                    // 13 = CF_UNICODETEXT; ownership passes to the clipboard on success.
+                    if SetClipboardData(13, Some(HANDLE(hmem.0))).is_err() {
+                        let _ = windows::Win32::Foundation::GlobalFree(Some(hmem));
+                    }
+                } else {
+                    let _ = windows::Win32::Foundation::GlobalFree(Some(hmem));
+                }
+            }
+            let _ = CloseClipboard();
+        }
+    }
+
     fn ctrl_down() -> bool {
         unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
     }
@@ -464,20 +508,27 @@ impl App {
         match vk {
             v if v == VK_ESCAPE.0 => self.hide(),
             v if v == VK_RETURN.0 => {
-                if let Some(&idx) = self.matches.get(self.sel) {
+                let calc_rows = self.calc.is_some() as usize;
+                if self.calc.is_some() && self.sel == 0 {
+                    let text = self.calc.clone().unwrap();
+                    self.copy_to_clipboard(&text);
+                    self.hide();
+                } else if let Some(&idx) = self.matches.get(self.sel - calc_rows) {
                     launch(&self.apps[idx]);
                     self.hide();
                 }
             }
             v if v == VK_UP.0 => {
-                if !self.matches.is_empty() {
-                    self.sel = self.sel.checked_sub(1).unwrap_or(self.matches.len() - 1);
+                let n = self.total_rows();
+                if n > 0 {
+                    self.sel = self.sel.checked_sub(1).unwrap_or(n - 1);
                     self.invalidate();
                 }
             }
             v if v == VK_DOWN.0 => {
-                if !self.matches.is_empty() {
-                    self.sel = (self.sel + 1) % self.matches.len();
+                let n = self.total_rows();
+                if n > 0 {
+                    self.sel = (self.sel + 1) % n;
                     self.invalidate();
                 }
             }

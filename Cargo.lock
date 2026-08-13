@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "flick"
+name = "optim"
 version = "0.1.0"
 dependencies = [
  "windows",
