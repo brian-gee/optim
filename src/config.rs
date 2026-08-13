@@ -10,6 +10,8 @@ pub struct Config {
     pub hotkey_vk: u32,
     pub width: f32,
     pub max_rows: usize,
+    /// Editor executable for "Open Config"; empty = system default for .ini.
+    pub editor: String,
 }
 
 impl Default for Config {
@@ -24,6 +26,7 @@ impl Default for Config {
             hotkey_vk: 0x20,     // VK_SPACE
             width: 640.0,
             max_rows: 8,
+            editor: String::new(),
         }
     }
 }
@@ -48,6 +51,10 @@ hotkey = alt+space
 # window width (logical px) and max visible result rows
 width = 640
 max_rows = 8
+
+# editor for the Open Config command; empty = system default for .ini
+# e.g.  editor = C:\\Program Files\\Sublime Text\\sublime_text.exe
+editor =
 ";
 
 pub fn path() -> PathBuf {
@@ -81,6 +88,7 @@ pub fn load() -> Config {
             "dim" => set_hex(&mut c.dim, v),
             "sel" => set_hex(&mut c.sel, v),
             "font" if !v.is_empty() => c.font = v.to_string(),
+            "editor" => c.editor = v.trim_matches('"').to_string(),
             "hotkey" => {
                 if let Some((m, vk)) = parse_hotkey(v) {
                     c.hotkey_mods = m;

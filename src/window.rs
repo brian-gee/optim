@@ -76,6 +76,31 @@ const CMD_RELOAD_CONFIG: usize = 2;
 const CMD_REFRESH_APPS: usize = 3;
 const CMD_EXIT: usize = 4;
 
+/// Actions reachable both from the tray menu and as typed commands.
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    OpenConfig,
+    ReloadConfig,
+    RefreshApps,
+    Quit,
+}
+
+/// Typed commands: (display name, extra match keywords, action).
+/// Keywords let "exit"/"settings" find their commands too.
+const COMMANDS: [(&str, &str, Action); 4] = [
+    ("Open Config", "open config settings edit", Action::OpenConfig),
+    ("Reload Config", "reload config settings", Action::ReloadConfig),
+    ("Refresh Apps", "refresh apps index rescan", Action::RefreshApps),
+    ("Quit optim", "quit exit optim close", Action::Quit),
+];
+
+/// A result row: an installed app or a built-in command.
+#[derive(Clone, Copy)]
+enum Hit {
+    App(usize),
+    Cmd(usize),
+}
+
 // Logical layout (scaled by DPI at render time).
 const PAD: f32 = 18.0;
 const INPUT_H: f32 = 60.0;
@@ -114,7 +139,7 @@ pub struct App {
     caret: usize, // byte offset into query, always on a char boundary
     scale: f32,
     apps: Vec<AppEntry>,
-    matches: Vec<usize>, // indices into apps, best first
+    matches: Vec<Hit>, // best first
     calc: Option<String>, // formatted result; occupies row 0 when present
     sel: usize,
     cfg: Config,
@@ -244,30 +269,63 @@ impl App {
             let _ = DestroyMenu(menu);
 
             match cmd.0 as usize {
-                CMD_OPEN_CONFIG => {
-                    let path: Vec<u16> = config::path()
+                CMD_OPEN_CONFIG => self.run_action(Action::OpenConfig),
+                CMD_RELOAD_CONFIG => self.run_action(Action::ReloadConfig),
+                CMD_REFRESH_APPS => self.run_action(Action::RefreshApps),
+                CMD_EXIT => self.run_action(Action::Quit),
+                _ => {}
+            }
+        }
+    }
+
+    fn run_action(&mut self, action: Action) {
+        unsafe {
+            match action {
+                Action::OpenConfig => {
+                    let path16: Vec<u16> = config::path()
                         .to_string_lossy()
                         .encode_utf16()
                         .chain(std::iter::once(0))
                         .collect();
-                    ShellExecuteW(
-                        None,
-                        w!("open"),
-                        PCWSTR(path.as_ptr()),
-                        None,
-                        None,
-                        SW_SHOWNORMAL,
-                    );
+                    if self.cfg.editor.is_empty() {
+                        // System default handler for .ini.
+                        ShellExecuteW(
+                            None,
+                            w!("open"),
+                            PCWSTR(path16.as_ptr()),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    } else {
+                        // Configured editor with the config path as argument.
+                        let editor16: Vec<u16> = self
+                            .cfg
+                            .editor
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect();
+                        let arg: String = format!("\"{}\"", config::path().to_string_lossy());
+                        let arg16: Vec<u16> =
+                            arg.encode_utf16().chain(std::iter::once(0)).collect();
+                        ShellExecuteW(
+                            None,
+                            w!("open"),
+                            PCWSTR(editor16.as_ptr()),
+                            PCWSTR(arg16.as_ptr()),
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
                 }
-                CMD_RELOAD_CONFIG => self.reload_config(),
-                CMD_REFRESH_APPS => {
+                Action::ReloadConfig => self.reload_config(),
+                Action::RefreshApps => {
                     let hwnd_val = self.hwnd_val();
                     std::thread::spawn(move || crate::index::run_index(hwnd_val));
                 }
-                CMD_EXIT => {
+                Action::Quit => {
                     let _ = DestroyWindow(self.hwnd);
                 }
-                _ => {}
             }
         }
     }
@@ -310,20 +368,23 @@ impl App {
         self.calc = calc::eval(self.query.trim()).map(calc::format);
         let q = self.query.trim().to_lowercase();
         if !q.is_empty() {
-            let mut scored: Vec<(i32, usize)> = self
+            let mut scored: Vec<(i32, Hit)> = self
                 .apps
                 .iter()
                 .enumerate()
                 .filter_map(|(i, a)| {
                     matcher::score(&q, &a.name_lower).map(|s| {
                         let boost = self.frec.get(&a.name).copied().unwrap_or(0).min(10) * 4;
-                        (s + boost as i32, i)
+                        (s + boost as i32, Hit::App(i))
                     })
                 })
                 .collect();
-            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            scored.extend(COMMANDS.iter().enumerate().filter_map(|(i, (_, keys, _))| {
+                matcher::score(&q, keys).map(|s| (s, Hit::Cmd(i)))
+            }));
+            scored.sort_unstable_by_key(|&(s, _)| std::cmp::Reverse(s));
             self.matches
-                .extend(scored.iter().take(self.cfg.max_rows).map(|&(_, i)| i));
+                .extend(scored.iter().take(self.cfg.max_rows).map(|&(_, h)| h));
         }
         self.apply_size();
         self.invalidate();
@@ -604,17 +665,33 @@ impl App {
                         DWRITE_MEASURING_MODE_NATURAL,
                     );
                 } else {
-                    let idx = self.matches[row - calc_rows];
-                    if let Some(bmp) = Self::icon_bitmap(&mut gfx, &self.apps, idx) {
-                        gfx.rt.DrawBitmap(
-                            &bmp,
-                            Some(&icon_rect),
-                            1.0,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            None,
-                        );
-                    }
-                    let name16: Vec<u16> = self.apps[idx].name.encode_utf16().collect();
+                    let name: &str = match self.matches[row - calc_rows] {
+                        Hit::App(idx) => {
+                            if let Some(bmp) = Self::icon_bitmap(&mut gfx, &self.apps, idx) {
+                                gfx.rt.DrawBitmap(
+                                    &bmp,
+                                    Some(&icon_rect),
+                                    1.0,
+                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                    None,
+                                );
+                            }
+                            &self.apps[idx].name
+                        }
+                        Hit::Cmd(idx) => {
+                            let glyph: Vec<u16> = "\u{203A}".encode_utf16().collect(); // ›
+                            gfx.rt.DrawText(
+                                &glyph,
+                                &gfx.row_fmt,
+                                &D2D_RECT_F { left: pad + 4.0 * scale, ..text_rect },
+                                &gfx.dim,
+                                Default::default(),
+                                DWRITE_MEASURING_MODE_NATURAL,
+                            );
+                            COMMANDS[idx].0
+                        }
+                    };
+                    let name16: Vec<u16> = name.encode_utf16().collect();
                     gfx.rt.DrawText(
                         &name16,
                         &gfx.row_fmt,
@@ -734,11 +811,20 @@ impl App {
                     let text = self.calc.clone().unwrap();
                     self.copy_to_clipboard(&text);
                     self.hide();
-                } else if let Some(&idx) = self.matches.get(self.sel - calc_rows) {
-                    launch(&self.apps[idx]);
-                    let name = self.apps[idx].name.clone();
-                    frecency::bump(&mut self.frec, &name);
-                    self.hide();
+                } else {
+                    match self.matches.get(self.sel - calc_rows) {
+                        Some(&Hit::App(idx)) => {
+                            launch(&self.apps[idx]);
+                            let name = self.apps[idx].name.clone();
+                            frecency::bump(&mut self.frec, &name);
+                            self.hide();
+                        }
+                        Some(&Hit::Cmd(idx)) => {
+                            self.hide();
+                            self.run_action(COMMANDS[idx].2);
+                        }
+                        None => {}
+                    }
                 }
             }
             v if v == VK_UP.0 => {

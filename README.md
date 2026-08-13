@@ -8,6 +8,9 @@ no plugins — a single ~300 KB exe that idles around 11 MB.
 - Math in the box (`2+2*4`) → result row, **Enter** copies it
 - **↑/↓** navigate, **Enter** launches, **Esc** hides
 - Launch counts boost your frequent apps
+- Built-in commands ride the same search: type `open config`, `reload config`,
+  `refresh apps`, or `quit` (set `editor =` in the config to open it in your
+  editor of choice instead of the .ini default)
 - Index refreshes itself when apps are installed or removed — it never goes stale
 - Tray icon → Open Config / Reload Config / Refresh Apps / Exit
 
