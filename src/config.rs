@@ -12,6 +12,8 @@ pub struct Config {
     pub max_rows: usize,
     /// Result-row font size in logical px; the input line scales with it.
     pub font_size: f32,
+    /// Auto game mode: don't pop over fullscreen apps (triple-press overrides).
+    pub game_mode_auto: bool,
     /// Editor executable for "Open Config"; empty = system default for .ini.
     pub editor: String,
 }
@@ -29,6 +31,7 @@ impl Default for Config {
             width: 600.0,
             max_rows: 8,
             font_size: 15.0,
+            game_mode_auto: true,
             editor: String::new(),
         }
     }
@@ -77,6 +80,11 @@ max_rows = 8
 
 # result-row font size (logical px); input line and row heights scale with it
 font_size = 15
+
+# game mode: 'auto' blocks the popup while a fullscreen app has focus
+# (press the hotkey 3x within 2s to force it open); 'off' disables the check.
+# The forced toggle ('optim: Game Mode' command / tray menu) blocks everywhere.
+game_mode = auto
 
 # editor for the Open Config command; empty = system default for .ini
 # e.g.  editor = C:\\Program Files\\Sublime Text\\sublime_text.exe
@@ -150,6 +158,7 @@ pub fn load() -> Config {
                     c.font_size = s.clamp(8.0, 32.0);
                 }
             }
+            "game_mode" => c.game_mode_auto = !v.eq_ignore_ascii_case("off"),
             _ => {}
         }
     }

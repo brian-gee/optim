@@ -30,14 +30,24 @@ fn shutdown_exe(args: PCWSTR) {
         ShellExecuteW(None, w!("open"), w!("shutdown.exe"), args, None, SW_SHOWNORMAL);
     }
 }
+
+/// True while the foreground app is fullscreen (game, video, presentation).
+fn fullscreen_app_active() -> bool {
+    use windows::Win32::UI::Shell::SHQueryUserNotificationState;
+    unsafe {
+        // 2 = busy (borderless fullscreen), 3 = D3D exclusive fullscreen,
+        // 4 = presentation mode, 7 = fullscreen store app.
+        matches!(SHQueryUserNotificationState(), Ok(s) if [2, 3, 4, 7].contains(&s.0))
+    }
+}
 use windows::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DestroyWindow, LoadIconW, TrackPopupMenu,
-    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_RBUTTONUP,
+    IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_RBUTTONUP,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::DataExchange::{
@@ -84,6 +94,7 @@ const CMD_OPEN_CONFIG: usize = 1;
 const CMD_RELOAD_CONFIG: usize = 2;
 const CMD_REFRESH_APPS: usize = 3;
 const CMD_EXIT: usize = 4;
+const CMD_GAME_MODE: usize = 5;
 
 /// Actions reachable both from the tray menu and as typed commands.
 #[derive(Clone, Copy, PartialEq)]
@@ -97,14 +108,16 @@ enum Action {
     Sleep,
     Lock,
     SignOut,
+    ToggleGameMode,
 }
 
 /// Typed commands: (display name, extra match keywords, action).
 /// Keywords let "exit"/"settings"/"reboot" find their commands too.
-const COMMANDS: [(&str, &str, Action); 9] = [
+const COMMANDS: [(&str, &str, Action); 10] = [
     ("optim: Open Config", "optim open config settings edit", Action::OpenConfig),
     ("optim: Reload Config", "optim reload config settings", Action::ReloadConfig),
     ("optim: Refresh Apps", "optim refresh apps index rescan", Action::RefreshApps),
+    ("optim: Game Mode", "optim game mode gaming toggle block", Action::ToggleGameMode),
     ("optim: Quit", "optim quit exit close", Action::Quit),
     ("Restart", "restart reboot system power", Action::Restart),
     ("Shut Down", "shut down shutdown power off system", Action::Shutdown),
@@ -165,6 +178,9 @@ pub struct App {
     cfg: Config,
     frec: HashMap<String, u32>,
     last_index: Instant,
+    select_all: bool,
+    forced_game_mode: bool,
+    hotkey_presses: Vec<Instant>,
     /// Private collection holding the bundled Iosevka; None → system fonts only.
     iosevka: Option<windows::Win32::Graphics::DirectWrite::IDWriteFontCollection>,
 }
@@ -203,6 +219,9 @@ impl App {
                 cfg: config::load(),
                 frec: frecency::load(),
                 last_index: Instant::now(),
+                select_all: false,
+                forced_game_mode: false,
+                hotkey_presses: Vec::new(),
                 iosevka,
             });
 
@@ -281,6 +300,12 @@ impl App {
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open Config"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD_CONFIG, w!("Reload Config"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH_APPS, w!("Refresh Apps"));
+            let game_flags = if self.forced_game_mode {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(menu, game_flags, CMD_GAME_MODE, w!("Game Mode"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
 
@@ -302,6 +327,7 @@ impl App {
                 CMD_OPEN_CONFIG => self.run_action(Action::OpenConfig),
                 CMD_RELOAD_CONFIG => self.run_action(Action::ReloadConfig),
                 CMD_REFRESH_APPS => self.run_action(Action::RefreshApps),
+                CMD_GAME_MODE => self.run_action(Action::ToggleGameMode),
                 CMD_EXIT => self.run_action(Action::Quit),
                 _ => {}
             }
@@ -364,6 +390,9 @@ impl App {
                 }
                 Action::Lock => {
                     let _ = LockWorkStation();
+                }
+                Action::ToggleGameMode => {
+                    self.forced_game_mode = !self.forced_game_mode;
                 }
             }
         }
@@ -498,6 +527,7 @@ impl App {
         unsafe {
             self.query.clear();
             self.caret = 0;
+            self.select_all = false;
             self.matches.clear();
             self.calc = None;
             self.sel = 0;
@@ -541,6 +571,26 @@ impl App {
 
     fn is_visible(&self) -> bool {
         unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
+    }
+
+    /// Game-mode gate. Three presses inside two seconds always win — that's
+    /// the escape hatch out of both automatic and forced blocking.
+    fn hotkey_show_allowed(&mut self) -> bool {
+        let now = Instant::now();
+        self.hotkey_presses
+            .retain(|t| now.duration_since(*t).as_millis() <= 2000);
+        self.hotkey_presses.push(now);
+        if self.hotkey_presses.len() >= 3 {
+            self.hotkey_presses.clear();
+            return true;
+        }
+        if self.forced_game_mode {
+            return false;
+        }
+        if self.cfg.game_mode_auto && fullscreen_app_active() {
+            return false;
+        }
+        true
     }
 
     fn build_gfx(&self) -> Result<Gfx> {
@@ -681,6 +731,31 @@ impl App {
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
             } else {
+                if self.select_all {
+                    // Selection highlight behind the whole query.
+                    let width = if let Ok(layout) = self.dwrite.CreateTextLayout(
+                        &query_utf16,
+                        &gfx.input_fmt,
+                        f32::MAX,
+                        input_h,
+                    ) {
+                        let mut m = DWRITE_TEXT_METRICS::default();
+                        let _ = layout.GetMetrics(&mut m);
+                        m.widthIncludingTrailingWhitespace
+                    } else {
+                        0.0
+                    };
+                    let cy = input_h / 2.0;
+                    gfx.rt.FillRectangle(
+                        &D2D_RECT_F {
+                            left: pad - 2.0 * scale,
+                            top: cy - font_h / 2.0,
+                            right: pad + width + 2.0 * scale,
+                            bottom: cy + font_h / 2.0,
+                        },
+                        &gfx.sel,
+                    );
+                }
                 gfx.rt.DrawText(
                     &query_utf16,
                     &gfx.input_fmt,
@@ -691,29 +766,32 @@ impl App {
                 );
             }
 
-            // Caret: measure text up to caret, draw a thin bar.
-            let caret_x = if caret_utf16.is_empty() {
-                0.0
-            } else if let Ok(layout) =
-                self.dwrite
-                    .CreateTextLayout(&caret_utf16, &gfx.input_fmt, f32::MAX, input_h)
-            {
-                let mut m = DWRITE_TEXT_METRICS::default();
-                let _ = layout.GetMetrics(&mut m);
-                m.widthIncludingTrailingWhitespace
-            } else {
-                0.0
-            };
-            let cy = input_h / 2.0;
-            gfx.rt.FillRectangle(
-                &D2D_RECT_F {
-                    left: pad + caret_x + 1.0,
-                    top: cy - font_h / 2.0,
-                    right: pad + caret_x + 1.0 + 2.0 * scale,
-                    bottom: cy + font_h / 2.0,
-                },
-                &gfx.fg,
-            );
+            // Caret: measure text up to caret, draw a thin bar (hidden while
+            // a selection is active).
+            if !self.select_all {
+                let caret_x = if caret_utf16.is_empty() {
+                    0.0
+                } else if let Ok(layout) =
+                    self.dwrite
+                        .CreateTextLayout(&caret_utf16, &gfx.input_fmt, f32::MAX, input_h)
+                {
+                    let mut m = DWRITE_TEXT_METRICS::default();
+                    let _ = layout.GetMetrics(&mut m);
+                    m.widthIncludingTrailingWhitespace
+                } else {
+                    0.0
+                };
+                let cy = input_h / 2.0;
+                gfx.rt.FillRectangle(
+                    &D2D_RECT_F {
+                        left: pad + caret_x + 1.0,
+                        top: cy - font_h / 2.0,
+                        right: pad + caret_x + 1.0 + 2.0 * scale,
+                        bottom: cy + font_h / 2.0,
+                    },
+                    &gfx.fg,
+                );
+            }
 
             // Result rows: calc first (an "=" in the icon slot), then apps.
             let calc_rows = self.calc.is_some() as usize;
@@ -894,21 +972,38 @@ impl App {
         }
     }
 
+    fn clear_selection_with_query(&mut self) {
+        self.query.clear();
+        self.caret = 0;
+        self.select_all = false;
+    }
+
     fn on_char(&mut self, c: u16) {
         match c {
             0x08 => {
                 // Backspace (Ctrl+Backspace arrives as 0x7F on some layouts; handle both)
-                let start = self.prev_boundary(Self::ctrl_down());
-                self.query.replace_range(start..self.caret, "");
-                self.caret = start;
+                if self.select_all {
+                    self.clear_selection_with_query();
+                } else {
+                    let start = self.prev_boundary(Self::ctrl_down());
+                    self.query.replace_range(start..self.caret, "");
+                    self.caret = start;
+                }
             }
             0x7F => {
-                let start = self.prev_boundary(true);
-                self.query.replace_range(start..self.caret, "");
-                self.caret = start;
+                if self.select_all {
+                    self.clear_selection_with_query();
+                } else {
+                    let start = self.prev_boundary(true);
+                    self.query.replace_range(start..self.caret, "");
+                    self.caret = start;
+                }
             }
-            0x0D | 0x1B | 0x09 => return, // Enter/Esc/Tab handled elsewhere
+            0x01 | 0x0D | 0x1B | 0x09 => return, // Ctrl+A/Enter/Esc/Tab handled in keydown
             c if c >= 0x20 => {
+                if self.select_all {
+                    self.clear_selection_with_query(); // typing replaces the selection
+                }
                 // TODO(surrogates): pair handling for astral-plane chars
                 if let Some(ch) = char::from_u32(c as u32) {
                     self.query.insert(self.caret, ch);
@@ -923,6 +1018,11 @@ impl App {
     fn on_keydown(&mut self, vk: u16) {
         match vk {
             v if v == VK_ESCAPE.0 => self.hide(),
+            0x41 if Self::ctrl_down() => {
+                // Ctrl+A
+                self.select_all = !self.query.is_empty();
+                self.invalidate();
+            }
             v if v == VK_RETURN.0 => {
                 let calc_rows = self.calc.is_some() as usize;
                 if self.calc.is_some() && self.sel == 0 {
@@ -964,24 +1064,40 @@ impl App {
                 }
             }
             v if v == VK_LEFT.0 => {
-                self.caret = self.prev_boundary(Self::ctrl_down());
+                if self.select_all {
+                    self.select_all = false;
+                    self.caret = 0; // collapse selection to its start
+                } else {
+                    self.caret = self.prev_boundary(Self::ctrl_down());
+                }
                 self.invalidate();
             }
             v if v == VK_RIGHT.0 => {
-                self.caret = self.next_boundary(Self::ctrl_down());
+                if self.select_all {
+                    self.select_all = false;
+                    self.caret = self.query.len();
+                } else {
+                    self.caret = self.next_boundary(Self::ctrl_down());
+                }
                 self.invalidate();
             }
             v if v == VK_HOME.0 => {
+                self.select_all = false;
                 self.caret = 0;
                 self.invalidate();
             }
             v if v == VK_END.0 => {
+                self.select_all = false;
                 self.caret = self.query.len();
                 self.invalidate();
             }
             v if v == VK_DELETE.0 => {
-                let end = self.next_boundary(Self::ctrl_down());
-                self.query.replace_range(self.caret..end, "");
+                if self.select_all {
+                    self.clear_selection_with_query();
+                } else {
+                    let end = self.next_boundary(Self::ctrl_down());
+                    self.query.replace_range(self.caret..end, "");
+                }
                 self.update_matches();
             }
             _ => {}
@@ -994,7 +1110,7 @@ impl App {
                 WM_HOTKEY => {
                     if self.is_visible() {
                         self.hide();
-                    } else {
+                    } else if self.hotkey_show_allowed() {
                         self.show();
                     }
                     LRESULT(0)
