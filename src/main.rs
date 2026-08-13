@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
 mod calc;
+mod config;
+mod frecency;
 mod index;
 mod matcher;
 mod window;
@@ -38,6 +40,18 @@ fn main() -> Result<()> {
 
         let hwnd_val = _app.hwnd_val();
         std::thread::spawn(move || index::run_index(hwnd_val));
+
+        // Watch both Start Menu program folders so new apps appear live.
+        for base in [
+            std::env::var("APPDATA").ok(),
+            std::env::var("ProgramData").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let dir = format!("{base}\\Microsoft\\Windows\\Start Menu\\Programs");
+            std::thread::spawn(move || index::watch_dir(dir, hwnd_val));
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

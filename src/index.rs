@@ -1,21 +1,36 @@
-use windows::core::{w, Result, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::core::{w, Interface, Result, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName, ShellExecuteExW,
-    SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory,
+    SHCreateItemFromParsingName, ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNORMAL};
 
 use crate::window::WM_APP_INDEXED;
+
+/// Icon edge length in physical pixels as extracted; scaled at draw time.
+pub const ICON_SIZE: i32 = 32;
 
 pub struct AppEntry {
     pub name: String,
     pub name_lower: String,
     /// Null-terminated UTF-16 of `shell:AppsFolder\<parsing name>` — ready for ShellExecuteExW.
     pub launch_id: Vec<u16>,
+    /// 32x32 top-down premultiplied BGRA, if the shell could produce one.
+    pub icon: Option<Vec<u8>>,
 }
 
 /// Runs on a background thread; posts a Box<Vec<AppEntry>> to the UI thread when done.
@@ -73,9 +88,100 @@ fn enumerate() -> Result<Vec<AppEntry>> {
                 name_lower: name.to_lowercase(),
                 name,
                 launch_id,
+                icon: get_icon(&item),
             });
         }
         Ok(out)
+    }
+}
+
+fn get_icon(item: &IShellItem) -> Option<Vec<u8>> {
+    unsafe {
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+        let hbm = factory
+            .GetImage(
+                SIZE { cx: ICON_SIZE, cy: ICON_SIZE },
+                SIIGBF_ICONONLY | SIIGBF_RESIZETOFIT,
+            )
+            .ok()?;
+
+        let hdc = CreateCompatibleDC(None);
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: ICON_SIZE,
+                biHeight: -ICON_SIZE, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
+        let lines = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            ICON_SIZE as u32,
+            Some(buf.as_mut_ptr() as _),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(HGDIOBJ(hbm.0));
+        if lines == 0 {
+            return None;
+        }
+        // Bitmaps without an alpha channel come back all-zero in A; treat as opaque.
+        if buf.chunks_exact(4).all(|p| p[3] == 0) {
+            for p in buf.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+        }
+        Some(buf)
+    }
+}
+
+/// Blocks on directory changes under a Start Menu programs folder and
+/// re-indexes (debounced) so new/renamed .lnk apps appear while optim runs.
+pub fn watch_dir(dir: String, hwnd_val: isize) {
+    unsafe {
+        let path16: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
+        let Ok(handle) = CreateFileW(
+            PCWSTR(path16.as_ptr()),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        ) else {
+            return;
+        };
+        loop {
+            let mut buf = [0u8; 8192];
+            let mut returned = 0u32;
+            if ReadDirectoryChangesW(
+                handle,
+                buf.as_mut_ptr() as _,
+                buf.len() as u32,
+                true,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_DIR_NAME
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                Some(&mut returned),
+                None,
+                None,
+            )
+            .is_err()
+            {
+                return;
+            }
+            // Debounce installer bursts, then rebuild the index on this thread.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            run_index(hwnd_val);
+        }
     }
 }
 

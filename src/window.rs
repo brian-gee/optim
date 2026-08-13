@@ -2,16 +2,34 @@ use std::ffi::c_void;
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
 use crate::calc;
-use crate::index::{launch, AppEntry};
+use crate::config::{self, Config};
+use crate::frecency;
+use crate::index::{launch, AppEntry, ICON_SIZE};
 use crate::matcher;
+use std::collections::HashMap;
+use std::time::Instant;
+use windows::Win32::UI::Input::KeyboardAndMouse::{UnregisterHotKey, HOT_KEY_MODIFIERS};
+use windows::Win32::UI::Shell::{
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, DestroyWindow, LoadIconW, TrackPopupMenu,
+    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_RBUTTONUP,
+};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -48,26 +66,31 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const WINDOW_CLASS: PCWSTR = w!("optim_window");
 pub const WM_APP_SHOW: u32 = WM_APP + 1;
 pub const WM_APP_INDEXED: u32 = WM_APP + 2;
+const WM_APP_TRAY: u32 = WM_APP + 3;
 const HOTKEY_ID: i32 = 1;
+const MOD_NOREPEAT_BIT: u32 = 0x4000;
+
+// Tray menu command ids.
+const CMD_OPEN_CONFIG: usize = 1;
+const CMD_RELOAD_CONFIG: usize = 2;
+const CMD_REFRESH_APPS: usize = 3;
+const CMD_EXIT: usize = 4;
 
 // Logical layout (scaled by DPI at render time).
-const WIN_W: f32 = 640.0;
 const PAD: f32 = 18.0;
 const INPUT_H: f32 = 60.0;
 const INPUT_FONT: f32 = 20.0;
 const ROW_H: f32 = 42.0;
 const ROW_FONT: f32 = 15.0;
 const BOTTOM_PAD: f32 = 8.0;
-const MAX_ROWS: usize = 8;
 
-// Palette — near-black, minimal.
-const BG: D2D1_COLOR_F = rgb(0x1B, 0x1B, 0x1D);
-const FG: D2D1_COLOR_F = rgb(0xEC, 0xEC, 0xEE);
-const DIM: D2D1_COLOR_F = rgb(0x77, 0x77, 0x7C);
-const SEL: D2D1_COLOR_F = rgb(0x2C, 0x2C, 0x31);
-
-const fn rgb(r: u8, g: u8, b: u8) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+fn col(v: u32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: ((v >> 16) & 0xFF) as f32 / 255.0,
+        g: ((v >> 8) & 0xFF) as f32 / 255.0,
+        b: (v & 0xFF) as f32 / 255.0,
+        a: 1.0,
+    }
 }
 
 struct Gfx {
@@ -77,6 +100,9 @@ struct Gfx {
     sel: ID2D1SolidColorBrush,
     input_fmt: IDWriteTextFormat,
     row_fmt: IDWriteTextFormat,
+    /// Per-app D2D bitmaps, keyed by index into `App::apps`. Device-bound, so
+    /// this dies with the render target and is cleared on re-index.
+    icons: HashMap<usize, Option<ID2D1Bitmap>>,
 }
 
 pub struct App {
@@ -91,6 +117,9 @@ pub struct App {
     matches: Vec<usize>, // indices into apps, best first
     calc: Option<String>, // formatted result; occupies row 0 when present
     sel: usize,
+    cfg: Config,
+    frec: HashMap<String, u32>,
+    last_index: Instant,
 }
 
 impl App {
@@ -123,6 +152,9 @@ impl App {
                 matches: Vec::new(),
                 calc: None,
                 sel: 0,
+                cfg: config::load(),
+                frec: frecency::load(),
+                last_index: Instant::now(),
             });
 
             let hwnd = CreateWindowExW(
@@ -147,9 +179,107 @@ impl App {
                 std::mem::size_of_val(&corner) as u32,
             );
 
-            RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32)?;
+            app.register_hotkey()?;
+            app.add_tray_icon();
 
             Ok(app)
+        }
+    }
+
+    fn register_hotkey(&self) -> Result<()> {
+        unsafe {
+            let mods = HOT_KEY_MODIFIERS(self.cfg.hotkey_mods | MOD_NOREPEAT_BIT);
+            if RegisterHotKey(Some(self.hwnd), HOTKEY_ID, mods, self.cfg.hotkey_vk).is_err() {
+                // Config combo unavailable — fall back to Alt+Space so optim stays reachable.
+                RegisterHotKey(
+                    Some(self.hwnd),
+                    HOTKEY_ID,
+                    MOD_ALT | MOD_NOREPEAT,
+                    VK_SPACE.0 as u32,
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    fn add_tray_icon(&self) {
+        unsafe {
+            let mut nid = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.hwnd,
+                uID: 1,
+                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+                uCallbackMessage: WM_APP_TRAY,
+                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+                ..Default::default()
+            };
+            for (i, u) in "optim".encode_utf16().enumerate() {
+                nid.szTip[i] = u;
+            }
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+    }
+
+    fn tray_menu(&mut self) {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN_CONFIG, w!("Open Config"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD_CONFIG, w!("Reload Config"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH_APPS, w!("Refresh Apps"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(self.hwnd); // so the menu dismisses on outside click
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+
+            match cmd.0 as usize {
+                CMD_OPEN_CONFIG => {
+                    let path: Vec<u16> = config::path()
+                        .to_string_lossy()
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    ShellExecuteW(
+                        None,
+                        w!("open"),
+                        PCWSTR(path.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+                CMD_RELOAD_CONFIG => self.reload_config(),
+                CMD_REFRESH_APPS => {
+                    let hwnd_val = self.hwnd_val();
+                    std::thread::spawn(move || crate::index::run_index(hwnd_val));
+                }
+                CMD_EXIT => {
+                    let _ = DestroyWindow(self.hwnd);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reload_config(&mut self) {
+        unsafe {
+            self.cfg = config::load();
+            self.gfx = None; // brushes and text formats rebuild from new config
+            let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            let _ = self.register_hotkey();
+            self.apply_size();
+            self.invalidate();
         }
     }
 
@@ -171,7 +301,7 @@ impl App {
         if rows > 0 {
             h += BOTTOM_PAD;
         }
-        (self.px(WIN_W) as i32, self.px(h) as i32)
+        (self.px(self.cfg.width) as i32, self.px(h) as i32)
     }
 
     fn update_matches(&mut self) {
@@ -184,10 +314,16 @@ impl App {
                 .apps
                 .iter()
                 .enumerate()
-                .filter_map(|(i, a)| matcher::score(&q, &a.name_lower).map(|s| (s, i)))
+                .filter_map(|(i, a)| {
+                    matcher::score(&q, &a.name_lower).map(|s| {
+                        let boost = self.frec.get(&a.name).copied().unwrap_or(0).min(10) * 4;
+                        (s + boost as i32, i)
+                    })
+                })
                 .collect();
             scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-            self.matches.extend(scored.iter().take(MAX_ROWS).map(|&(_, i)| i));
+            self.matches
+                .extend(scored.iter().take(self.cfg.max_rows).map(|&(_, i)| i));
         }
         self.apply_size();
         self.invalidate();
@@ -215,6 +351,14 @@ impl App {
             self.matches.clear();
             self.calc = None;
             self.sel = 0;
+
+            // Staleness guard: refresh in the background if the index is old.
+            // Covers MSIX installs/updates the Start Menu watcher can't see.
+            if self.last_index.elapsed().as_secs() > 300 {
+                self.last_index = Instant::now();
+                let hwnd_val = self.hwnd_val();
+                std::thread::spawn(move || crate::index::run_index(hwnd_val));
+            }
 
             // Place on the monitor holding the cursor, centered, upper third.
             let mut pt = POINT::default();
@@ -245,8 +389,8 @@ impl App {
         unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd).as_bool() }
     }
 
-    fn ensure_gfx(&mut self) -> Result<&Gfx> {
-        if self.gfx.is_none() {
+    fn build_gfx(&self) -> Result<Gfx> {
+        {
             unsafe {
                 let (w, h) = self.desired_size();
                 let rt = self.d2d_factory.CreateHwndRenderTarget(
@@ -261,11 +405,18 @@ impl App {
                         presentOptions: D2D1_PRESENT_OPTIONS_NONE,
                     },
                 )?;
-                let fg = rt.CreateSolidColorBrush(&FG, None)?;
-                let dim = rt.CreateSolidColorBrush(&DIM, None)?;
-                let sel = rt.CreateSolidColorBrush(&SEL, None)?;
+                let fg = rt.CreateSolidColorBrush(&col(self.cfg.fg), None)?;
+                let dim = rt.CreateSolidColorBrush(&col(self.cfg.dim), None)?;
+                let sel = rt.CreateSolidColorBrush(&col(self.cfg.sel), None)?;
+                let font16: Vec<u16> = self
+                    .cfg
+                    .font
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let font = PCWSTR(font16.as_ptr());
                 let input_fmt = self.dwrite.CreateTextFormat(
-                    w!("Segoe UI Variable Text"),
+                    font,
                     None,
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
@@ -275,7 +426,7 @@ impl App {
                 )?;
                 input_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 let row_fmt = self.dwrite.CreateTextFormat(
-                    w!("Segoe UI Variable Text"),
+                    font,
                     None,
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
@@ -284,14 +435,55 @@ impl App {
                     w!("en-us"),
                 )?;
                 row_fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-                self.gfx = Some(Gfx { rt, fg, dim, sel, input_fmt, row_fmt });
+                Ok(Gfx {
+                    rt,
+                    fg,
+                    dim,
+                    sel,
+                    input_fmt,
+                    row_fmt,
+                    icons: HashMap::new(),
+                })
             }
         }
-        Ok(self.gfx.as_ref().unwrap())
+    }
+
+    /// Returns the cached D2D bitmap for an app, creating it from the
+    /// extracted BGRA pixels on first use. Cloning a COM pointer is an AddRef.
+    fn icon_bitmap(gfx: &mut Gfx, apps: &[AppEntry], idx: usize) -> Option<ID2D1Bitmap> {
+        let rt = gfx.rt.clone();
+        gfx.icons
+            .entry(idx)
+            .or_insert_with(|| unsafe {
+                let pixels = apps[idx].icon.as_ref()?;
+                rt.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: ICON_SIZE as u32,
+                        height: ICON_SIZE as u32,
+                    },
+                    Some(pixels.as_ptr() as _),
+                    (ICON_SIZE * 4) as u32,
+                    &D2D1_BITMAP_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                    },
+                )
+                .ok()
+            })
+            .clone()
     }
 
     fn render(&mut self) {
-        let (w, h) = self.desired_size();
+        if self.gfx.is_none() {
+            self.gfx = self.build_gfx().ok();
+        }
+        let Some(mut gfx) = self.gfx.take() else { return };
+
+        let (w, _h) = self.desired_size();
         let query_utf16: Vec<u16> = self.query.encode_utf16().collect();
         let caret_utf16: Vec<u16> = self.query[..self.caret].encode_utf16().collect();
         let pad = self.px(PAD);
@@ -299,23 +491,12 @@ impl App {
         let row_h = self.px(ROW_H);
         let font_h = self.px(INPUT_FONT) * 1.3;
         let scale = self.scale;
-        let dwrite = self.dwrite.clone();
-        let mut rows: Vec<(Vec<u16>, bool)> = Vec::with_capacity(self.total_rows());
-        if let Some(result) = &self.calc {
-            rows.push((format!("= {result}").encode_utf16().collect(), self.sel == 0));
-        }
-        let calc_rows = self.calc.is_some() as usize;
-        rows.extend(self.matches.iter().enumerate().map(|(n, &i)| {
-            (
-                self.apps[i].name.encode_utf16().collect(),
-                n + calc_rows == self.sel,
-            )
-        }));
+        let icon_edge = 20.0 * scale;
+        let text_left = pad + icon_edge + 12.0 * scale; // rows indent past the icon slot
 
-        let Ok(gfx) = self.ensure_gfx() else { return };
         unsafe {
             gfx.rt.BeginDraw();
-            gfx.rt.Clear(Some(&BG));
+            gfx.rt.Clear(Some(&col(self.cfg.bg)));
 
             let input_rect = D2D_RECT_F {
                 left: pad,
@@ -348,12 +529,10 @@ impl App {
             // Caret: measure text up to caret, draw a thin bar.
             let caret_x = if caret_utf16.is_empty() {
                 0.0
-            } else if let Ok(layout) = dwrite.CreateTextLayout(
-                &caret_utf16,
-                &gfx.input_fmt,
-                f32::MAX,
-                input_h,
-            ) {
+            } else if let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(&caret_utf16, &gfx.input_fmt, f32::MAX, input_h)
+            {
                 let mut m = DWRITE_TEXT_METRICS::default();
                 let _ = layout.GetMetrics(&mut m);
                 m.widthIncludingTrailingWhitespace
@@ -371,11 +550,11 @@ impl App {
                 &gfx.fg,
             );
 
-            // Result rows.
-            let _ = h;
-            for (n, (name16, selected)) in rows.iter().enumerate() {
-                let top = input_h + n as f32 * row_h;
-                if *selected {
+            // Result rows: calc first (an "=" in the icon slot), then apps.
+            let calc_rows = self.calc.is_some() as usize;
+            for row in 0..self.total_rows() {
+                let top = input_h + row as f32 * row_h;
+                if row == self.sel {
                     gfx.rt.FillRoundedRectangle(
                         &D2D1_ROUNDED_RECT {
                             rect: D2D_RECT_F {
@@ -390,23 +569,65 @@ impl App {
                         &gfx.sel,
                     );
                 }
-                gfx.rt.DrawText(
-                    name16,
-                    &gfx.row_fmt,
-                    &D2D_RECT_F {
-                        left: pad,
-                        top,
-                        right: w as f32 - pad,
-                        bottom: top + row_h,
-                    },
-                    &gfx.fg,
-                    Default::default(),
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
+
+                let icon_rect = D2D_RECT_F {
+                    left: pad,
+                    top: top + (row_h - icon_edge) / 2.0,
+                    right: pad + icon_edge,
+                    bottom: top + (row_h + icon_edge) / 2.0,
+                };
+                let text_rect = D2D_RECT_F {
+                    left: text_left,
+                    top,
+                    right: w as f32 - pad,
+                    bottom: top + row_h,
+                };
+
+                if row < calc_rows {
+                    let eq: Vec<u16> = "=".encode_utf16().collect();
+                    gfx.rt.DrawText(
+                        &eq,
+                        &gfx.row_fmt,
+                        &D2D_RECT_F { left: pad, ..text_rect },
+                        &gfx.dim,
+                        Default::default(),
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                    let result16: Vec<u16> =
+                        self.calc.as_deref().unwrap_or("").encode_utf16().collect();
+                    gfx.rt.DrawText(
+                        &result16,
+                        &gfx.row_fmt,
+                        &text_rect,
+                        &gfx.fg,
+                        Default::default(),
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                } else {
+                    let idx = self.matches[row - calc_rows];
+                    if let Some(bmp) = Self::icon_bitmap(&mut gfx, &self.apps, idx) {
+                        gfx.rt.DrawBitmap(
+                            &bmp,
+                            Some(&icon_rect),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                    let name16: Vec<u16> = self.apps[idx].name.encode_utf16().collect();
+                    gfx.rt.DrawText(
+                        &name16,
+                        &gfx.row_fmt,
+                        &text_rect,
+                        &gfx.fg,
+                        Default::default(),
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
             }
 
-            if gfx.rt.EndDraw(None, None).is_err() {
-                self.gfx = None; // device lost — recreate next frame
+            if gfx.rt.EndDraw(None, None).is_ok() {
+                self.gfx = Some(gfx); // else: device lost — rebuild next frame
             }
         }
     }
@@ -515,6 +736,8 @@ impl App {
                     self.hide();
                 } else if let Some(&idx) = self.matches.get(self.sel - calc_rows) {
                     launch(&self.apps[idx]);
+                    let name = self.apps[idx].name.clone();
+                    frecency::bump(&mut self.frec, &name);
                     self.hide();
                 }
             }
@@ -575,6 +798,10 @@ impl App {
                 WM_APP_INDEXED => {
                     let boxed = Box::from_raw(lparam.0 as *mut Vec<AppEntry>);
                     self.apps = *boxed;
+                    self.last_index = Instant::now();
+                    if let Some(gfx) = &mut self.gfx {
+                        gfx.icons.clear(); // indices into apps changed
+                    }
                     self.update_matches();
                     LRESULT(0)
                 }
@@ -623,7 +850,20 @@ impl App {
                     );
                     LRESULT(0)
                 }
+                WM_APP_TRAY => {
+                    if (lparam.0 as u32 & 0xFFFF) == WM_RBUTTONUP {
+                        self.tray_menu();
+                    }
+                    LRESULT(0)
+                }
                 WM_DESTROY => {
+                    let nid = NOTIFYICONDATAW {
+                        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                        hWnd: hwnd,
+                        uID: 1,
+                        ..Default::default()
+                    };
+                    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
                     PostQuitMessage(0);
                     LRESULT(0)
                 }
