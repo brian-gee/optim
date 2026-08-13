@@ -981,6 +981,44 @@ impl App {
         }
     }
 
+    fn paste_clipboard(&mut self) {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::GetClipboardData;
+        unsafe {
+            if OpenClipboard(Some(self.hwnd)).is_err() {
+                return;
+            }
+            let mut text = String::new();
+            if let Ok(h) = GetClipboardData(13) {
+                // 13 = CF_UNICODETEXT
+                let mem = HGLOBAL(h.0);
+                let ptr = GlobalLock(mem) as *const u16;
+                if !ptr.is_null() {
+                    let mut len = 0usize;
+                    while *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+                    let _ = GlobalUnlock(mem);
+                }
+            }
+            let _ = CloseClipboard();
+
+            // Single-line input: drop control chars (newlines, tabs), trim.
+            let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+            let cleaned = cleaned.trim();
+            if cleaned.is_empty() {
+                return;
+            }
+            if self.select_all {
+                self.clear_selection_with_query();
+            }
+            self.query.insert_str(self.caret, cleaned);
+            self.caret += cleaned.len();
+            self.update_matches();
+        }
+    }
+
     fn copy_to_clipboard(&self, text: &str) {
         unsafe {
             let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1098,6 +1136,7 @@ impl App {
                 self.select_all = !self.query.is_empty();
                 self.invalidate();
             }
+            0x56 if Self::ctrl_down() => self.paste_clipboard(), // Ctrl+V
             v if v == VK_RETURN.0 => {
                 let calc_rows = self.calc.is_some() as usize;
                 if self.calc.is_some() && self.sel == 0 {
