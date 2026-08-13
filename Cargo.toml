@@ -5,6 +5,9 @@ edition = "2021"
 description = "Minimal, fast, native app launcher for Windows"
 license = "MIT"
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies.windows]
 version = "0.61"
 features = [

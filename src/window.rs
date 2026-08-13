@@ -253,13 +253,19 @@ impl App {
 
     fn add_tray_icon(&self) {
         unsafe {
+            // Embedded chevron icon (build.rs); generic app icon as fallback.
+            let icon = GetModuleHandleW(None)
+                .ok()
+                .and_then(|m| LoadIconW(Some(m.into()), w!("app_icon")).ok())
+                .or_else(|| LoadIconW(None, IDI_APPLICATION).ok())
+                .unwrap_or_default();
             let mut nid = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: self.hwnd,
                 uID: 1,
                 uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
                 uCallbackMessage: WM_APP_TRAY,
-                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+                hIcon: icon,
                 ..Default::default()
             };
             for (i, u) in "optim".encode_utf16().enumerate() {
