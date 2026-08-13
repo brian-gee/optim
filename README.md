@@ -6,7 +6,8 @@ no plugins — a single exe that idles around 11 MB.
 - **Alt+D** → instant popup
 - Type to fuzzy-search every installed app (classic and Store/MSIX alike)
 - Math in the box (`2+2*4`, trailing `=` ok) → result row, **Enter** copies it
-- **↑/↓** navigate, **Enter** launches, **Esc** hides
+- **↑/↓** navigate, **Enter** launches, **Ctrl+Shift+Enter** launches elevated
+  (also works for `>` commands), **Esc** hides
 - Launch counts boost your frequent apps
 - Built-in commands ride the same search, prefixed so they stand out:
   `optim: Open Config`, `optim: Reload Config`, `optim: Refresh Apps`, `optim: Quit`

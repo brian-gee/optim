@@ -190,10 +190,21 @@ pub fn watch_dir(dir: String, hwnd_val: isize) {
 }
 
 pub fn launch(entry: &AppEntry) {
+    launch_impl(entry, false);
+}
+
+/// Elevated launch (UAC prompt). MSIX/UWP apps ignore the verb — they run
+/// in their own container and can't be elevated this way.
+pub fn launch_admin(entry: &AppEntry) {
+    launch_impl(entry, true);
+}
+
+fn launch_impl(entry: &AppEntry, admin: bool) {
     unsafe {
         let mut sei = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOASYNC,
+            lpVerb: if admin { w!("runas") } else { PCWSTR::null() },
             lpFile: PCWSTR(entry.launch_id.as_ptr()),
             nShow: SW_SHOWNORMAL.0,
             ..Default::default()

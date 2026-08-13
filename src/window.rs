@@ -509,25 +509,27 @@ impl App {
         self.query.trim_start().strip_prefix('>').unwrap_or("").trim()
     }
 
-    fn run_in_terminal(&self) {
+    fn run_in_terminal(&self, admin: bool) {
         unsafe {
+            let verb = if admin { w!("runas") } else { w!("open") };
             let args = format!("cmd /k {}", self.terminal_command());
             let args16: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
             let h = ShellExecuteW(
                 None,
-                w!("open"),
+                verb,
                 w!("wt.exe"),
                 PCWSTR(args16.as_ptr()),
                 None,
                 SW_SHOWNORMAL,
             );
-            if h.0 as isize <= 32 {
-                // No Windows Terminal — plain cmd window.
+            // 2/3 = file/path not found. Only then try cmd.exe — a declined
+            // UAC prompt must not immediately re-prompt via the fallback.
+            if matches!(h.0 as isize, 2 | 3) {
                 let args = format!("/k {}", self.terminal_command());
                 let args16: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
                 ShellExecuteW(
                     None,
-                    w!("open"),
+                    verb,
                     w!("cmd.exe"),
                     PCWSTR(args16.as_ptr()),
                     None,
@@ -974,6 +976,11 @@ impl App {
         unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 }
     }
 
+    fn shift_down() -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
+        unsafe { (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0 }
+    }
+
     fn prev_boundary(&self, word: bool) -> usize {
         if !word {
             return self.query[..self.caret]
@@ -1064,9 +1071,15 @@ impl App {
                     self.copy_to_clipboard(&text);
                     self.hide();
                 } else {
+                    // Ctrl+Shift+Enter = run elevated.
+                    let admin = Self::ctrl_down() && Self::shift_down();
                     match self.matches.get(self.sel - calc_rows) {
                         Some(&Hit::App(idx)) => {
-                            launch(&self.apps[idx]);
+                            if admin {
+                                crate::index::launch_admin(&self.apps[idx]);
+                            } else {
+                                launch(&self.apps[idx]);
+                            }
                             let name = self.apps[idx].name.clone();
                             frecency::bump(&mut self.frec, &name);
                             self.hide();
@@ -1076,7 +1089,7 @@ impl App {
                             self.run_action(COMMANDS[idx].2);
                         }
                         Some(&Hit::Term) => {
-                            self.run_in_terminal();
+                            self.run_in_terminal(admin);
                             self.hide();
                         }
                         None => {}
