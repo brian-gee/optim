@@ -12,6 +12,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory,
     SHCreateItemFromParsingName, ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
@@ -51,6 +52,9 @@ pub fn run_index(hwnd_val: isize) {
             // Window is gone; nothing to deliver to.
         }
         CoUninitialize();
+        // Icon extraction drags shell DLL pages into the working set; give
+        // them back so resident memory reflects what optim actually uses.
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 

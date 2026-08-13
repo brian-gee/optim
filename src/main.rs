@@ -20,7 +20,44 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use window::{App, WINDOW_CLASS, WM_APP_SHOW};
 
+/// Adds or removes the HKCU Run entry that starts optim at logon.
+fn set_autostart(enable: bool) -> Result<()> {
+    use windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+    };
+    unsafe {
+        let subkey = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let name = w!("optim");
+        if enable {
+            let exe = std::env::current_exe().map_err(|_| windows::core::Error::empty())?;
+            let path16: Vec<u16> = exe
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                subkey,
+                name,
+                REG_SZ.0,
+                Some(path16.as_ptr() as _),
+                (path16.len() * 2) as u32,
+            )
+            .ok()?;
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey, name).ok()?;
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--install-autostart") {
+        return set_autostart(true);
+    }
+    if std::env::args().any(|a| a == "--uninstall-autostart") {
+        return set_autostart(false);
+    }
     unsafe {
         // Single instance: if optim is already running, tell it to show itself and exit.
         let _mutex = CreateMutexW(None, true, w!("optim_single_instance_mutex"))?;
