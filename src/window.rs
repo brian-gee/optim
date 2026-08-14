@@ -25,10 +25,13 @@ use windows::Win32::System::Power::SetSuspendState;
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{UnregisterHotKey, HOT_KEY_MODIFIERS};
 
-/// Fire-and-forget `shutdown.exe` with the given switches.
+/// Fire-and-forget `shutdown.exe` with the given switches. Hidden window —
+/// it's a console tool, and SW_SHOWNORMAL flashed a console box that made
+/// the built-in power actions look like scripts.
 fn shutdown_exe(args: PCWSTR) {
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     unsafe {
-        ShellExecuteW(None, w!("open"), w!("shutdown.exe"), args, None, SW_SHOWNORMAL);
+        ShellExecuteW(None, w!("open"), w!("shutdown.exe"), args, None, SW_HIDE);
     }
 }
 

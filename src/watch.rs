@@ -108,9 +108,52 @@ fn file_len(p: &std::path::Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
-fn open_in_shared_window(target: &str) {
-    if send_ipc(target).is_ok() {
+/// True while the shared instance's pipe answers.
+fn pipe_alive() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(PIPE)
+        .is_ok()
+}
+
+/// Tick of the last idle-window spawn, so two rapid pastes don't both
+/// launch an mpv (the second would lose the pipe and orphan a window).
+static SPAWNED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Show the shared window immediately (idle, no file) so Enter feels
+/// instant; the tab arrives once data is ready.
+fn warm_window() {
+    use std::sync::atomic::Ordering;
+    if pipe_alive() {
         return;
+    }
+    let last = SPAWNED_AT.load(Ordering::Relaxed);
+    let now = now_ms();
+    if now.saturating_sub(last) < 5000 {
+        return; // another paste just spawned it; its pipe is coming up
+    }
+    SPAWNED_AT.store(now, Ordering::Relaxed);
+    let _ = std::process::Command::new(mpv_exe())
+        .args(["--idle=yes", "--force-window=immediate"])
+        .spawn();
+}
+
+/// Append to the shared window, waiting briefly for a freshly spawned
+/// instance's pipe. Last resort: standalone window.
+fn open_in_shared_window(target: &str) {
+    for _ in 0..40 {
+        if send_ipc(target).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let _ = std::process::Command::new(mpv_exe())
         .arg("--force-window=yes")
@@ -128,6 +171,8 @@ pub fn play(url: &str) {
     const EARLY_PLAY_BYTES: u64 = 1024 * 1024;
     let url = url.to_string();
     std::thread::spawn(move || {
+        // The window appears NOW; data catches up to it.
+        warm_window();
         let _ = std::fs::create_dir_all(temp_dir());
         prune_old();
         let dest = dest_for(&url);
@@ -150,7 +195,7 @@ pub fn play(url: &str) {
             if let Some(status) = done {
                 break status;
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         };
         if !opened {
             // Download produced nothing — stream the URL directly instead.
