@@ -6,6 +6,7 @@
 --     X              close selected tab    D      detach selected
 --     1-9            jump to that tab      ESC    close menu
 --   Ctrl+TAB / Ctrl+Shift+TAB   next / previous tab (menu closed)
+--   Ctrl+W                       close current tab (last tab closes player)
 --   D                            detach current tab (menu closed)
 --
 -- Mouse:
@@ -67,7 +68,7 @@ local function render()
     local pos = mp.get_property_number("playlist-pos-1", 1)
     local ev = {
         string.format(
-            "{\\pos(%d,%d)\\an7\\fs24\\bord1.5\\b1}tabs{\\b0\\fs16\\alpha&H70&}   click switch · right-click close · wheel move · ESC",
+            "{\\pos(%d,%d)\\an7\\fs24\\bord1.5\\b1}tabs{\\b0\\fs16\\alpha&H70&}   ENTER/click switch · X/right-click close · D detach · Ctrl+W close current · ESC",
             MENU_X, TITLE_Y),
     }
     for i = 1, count do
@@ -204,6 +205,17 @@ mp.add_key_binding("Ctrl+WHEEL_UP", "tab-prev-wheel", function() cycle(-1) end)
 mp.add_key_binding("D", "detach-current", function()
     detach(mp.get_property_number("playlist-pos", 0))
     mp.osd_message("detached to its own window")
+end)
+
+-- Ctrl+W: close the current tab, browser-style. Last tab closes the player.
+mp.add_key_binding("Ctrl+w", "tab-close-current", function()
+    local count = playlist_count()
+    if count <= 1 then
+        mp.commandv("quit")
+        return
+    end
+    mp.commandv("playlist-remove", "current")
+    mp.osd_message(string.format("tab closed · %d left", count - 1))
 end)
 
 -- Keep the menu fresh while optim appends.
