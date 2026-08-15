@@ -28,6 +28,9 @@ pub const ICON_SIZE: i32 = 32;
 pub struct AppEntry {
     pub name: String,
     pub name_lower: String,
+    /// The shell's parsing name on its own. Unique and stable per app, so it
+    /// is what the hidden list keys on — display names collide and change.
+    pub key: String,
     /// Null-terminated UTF-16 of `shell:AppsFolder\<parsing name>` — ready for ShellExecuteExW.
     pub launch_id: Vec<u16>,
     /// 32x32 top-down premultiplied BGRA, if the shell could produce one.
@@ -91,6 +94,7 @@ fn enumerate() -> Result<Vec<AppEntry>> {
             out.push(AppEntry {
                 name_lower: name.to_lowercase(),
                 name,
+                key: parsing,
                 launch_id,
                 icon: get_icon(&item),
             });

@@ -1,17 +1,28 @@
 -- Tab-style playlist control for the shared optim player window.
 --
+-- The playlist IS optim's watch queue: it is restored every time the window
+-- opens, so a tab only disappears when it is dropped on purpose here. Dropping
+-- one calls back into optim (`--watch-forget`), which owns the history file and
+-- deletes the downloaded video with it.
+--
 -- Keyboard:
 --   TAB              open/close the tab menu
 --     UP/DOWN (j/k)  move selection        ENTER  switch to selected
---     X              close selected tab    D      detach selected
---     1-9            jump to that tab      ESC    close menu
---   Ctrl+TAB / Ctrl+Shift+TAB   next / previous tab (menu closed)
---   Ctrl+W                       close current tab (last tab closes player)
---   D                            detach current tab (menu closed)
+--     X / DEL        forget selected       D      detach selected
+--     C then C       forget everything     ESC    close menu
+--     1-9            jump to that tab
+--
+-- With the menu closed the same keys act on the current tab, so nothing falls
+-- through to mpv's stock bindings:
+--   X / DEL          forget current      D / d   detach current
+--   C then C         forget everything   1-9     switch to that tab
+--   j / k            next / previous tab
+--   Ctrl+TAB / Ctrl+Shift+TAB / Ctrl+wheel   next / previous tab
+--   Ctrl+W                                   forget current tab
 --
 -- Mouse:
 --   TAB menu open:  hover highlights - left-click switches -
---                   right-click closes that tab - middle-click detaches -
+--                   right-click forgets that tab - middle-click detaches -
 --                   wheel moves selection - click outside closes the menu
 --   Anywhere:       Ctrl+wheel cycles tabs
 --   (the stock OSC's |< >| buttons on hover also page the playlist)
@@ -56,6 +67,58 @@ local function detach(index0)
     end
 end
 
+-- optim writes its own location here at startup, so this script follows the
+-- build that is actually running instead of a path baked in at install time.
+local function optim_exe()
+    local dir = os.getenv("LOCALAPPDATA")
+    if not dir then return nil end
+    local f = io.open(dir .. "\\optim\\optim-exe.txt", "r")
+    if not f then return nil end
+    local path = f:read("*l")
+    f:close()
+    if path and #path > 0 then return path end
+    return nil
+end
+
+-- Drop a tab for good: out of the playlist, out of optim's history, and off
+-- the disk. The playlist entry goes first so mpv releases the file handle —
+-- Windows won't delete a video the player still has open.
+local function forget(index0)
+    local path = mp.get_property(string.format("playlist/%d/filename", index0))
+    local label = entry_label(index0 + 1)
+    mp.commandv("playlist-remove", tostring(index0))
+    local exe = optim_exe()
+    if not exe then
+        mp.osd_message("tab closed (optim not found - still in history)", 3)
+        return
+    end
+    if path then
+        mp.add_timeout(0.3, function()
+            mp.commandv("run", exe, "--watch-forget", path)
+        end)
+    end
+    mp.osd_message("forgot " .. label, 2)
+end
+
+-- Second press within the timeout wipes the whole queue; the first only warns.
+local clear_armed_until = 0
+local function clear_all()
+    local count = playlist_count()
+    if os.time() > clear_armed_until then
+        clear_armed_until = os.time() + 3
+        mp.osd_message(string.format("press C again to forget all %d videos", count), 3)
+        return
+    end
+    clear_armed_until = 0
+    local exe = optim_exe()
+    if not exe then
+        mp.osd_message("optim not found - clear from the launcher instead", 3)
+        return
+    end
+    mp.commandv("run", exe, "--watch-clear") -- optim empties the playlist itself
+    mp.osd_message("watch queue cleared", 3)
+end
+
 local function clamp_sel()
     local count = playlist_count()
     if sel > count then sel = count end
@@ -68,7 +131,7 @@ local function render()
     local pos = mp.get_property_number("playlist-pos-1", 1)
     local ev = {
         string.format(
-            "{\\pos(%d,%d)\\an7\\fs24\\bord1.5\\b1}tabs{\\b0\\fs16\\alpha&H70&}   ENTER/click switch · X/right-click close · D detach · Ctrl+W close current · ESC",
+            "{\\pos(%d,%d)\\an7\\fs24\\bord1.5\\b1}watch queue{\\b0\\fs16\\alpha&H70&}   ENTER switch · X forget · D detach · C C forget all · ESC",
             MENU_X, TITLE_Y),
     }
     for i = 1, count do
@@ -136,12 +199,9 @@ local function open_menu()
               mp.set_property_number("playlist-pos-1", sel)
               close_menu()
           end },
-        { "x", function()
-              if playlist_count() > 1 then
-                  mp.commandv("playlist-remove", tostring(sel - 1))
-              end
-              render(); poke_idle_timer()
-          end },
+        { "x", function() forget(sel - 1); render(); poke_idle_timer() end },
+        { "DEL", function() forget(sel - 1); render(); poke_idle_timer() end },
+        { "c", function() clear_all(); render(); poke_idle_timer() end },
         { "d", function() detach(sel - 1); render(); poke_idle_timer() end },
         { "ESC", function() close_menu() end },
         { "MOUSE_MOVE", function()
@@ -161,9 +221,7 @@ local function open_menu()
           end },
         { "MBTN_RIGHT", function()
               local row = row_at_mouse()
-              if row and playlist_count() > 1 then
-                  mp.commandv("playlist-remove", tostring(row - 1))
-              end
+              if row then forget(row - 1) end
               render(); poke_idle_timer()
           end },
         { "MBTN_MID", function()
@@ -202,21 +260,40 @@ mp.add_key_binding("Ctrl+Shift+TAB", "tab-prev", function() cycle(-1) end)
 mp.add_key_binding("Ctrl+WHEEL_DOWN", "tab-next-wheel", function() cycle(1) end)
 mp.add_key_binding("Ctrl+WHEEL_UP", "tab-prev-wheel", function() cycle(-1) end)
 
-mp.add_key_binding("D", "detach-current", function()
-    detach(mp.get_property_number("playlist-pos", 0))
-    mp.osd_message("detached to its own window")
-end)
+local function current()
+    return mp.get_property_number("playlist-pos", 0)
+end
 
--- Ctrl+W: close the current tab, browser-style. Last tab closes the player.
-mp.add_key_binding("Ctrl+w", "tab-close-current", function()
-    local count = playlist_count()
-    if count <= 1 then
-        mp.commandv("quit")
-        return
-    end
-    mp.commandv("playlist-remove", "current")
-    mp.osd_message(string.format("tab closed · %d left", count - 1))
-end)
+local function detach_current()
+    detach(current())
+    mp.osd_message("detached to its own window")
+end
+
+mp.add_key_binding("D", "detach-current", detach_current)
+
+-- Ctrl+W: drop the current tab, browser-style. Unlike a browser there is no
+-- reopening it — the queue is the history, so closing means forgetting.
+mp.add_key_binding("Ctrl+w", "tab-close-current", function() forget(current()) end)
+
+-- The tab menu's keys do the same thing with the menu closed. Without this,
+-- reaching for them outside the menu fell through to mpv's stock bindings and
+-- did something unrelated and unwanted: x was subtitle delay, d toggled
+-- deinterlacing, and 1-8 were the contrast/brightness/gamma/saturation
+-- controls, which quietly wreck the picture with no sign of what happened.
+mp.add_key_binding("x", "tab-forget", function() forget(current()) end)
+mp.add_key_binding("DEL", "tab-forget-del", function() forget(current()) end)
+mp.add_key_binding("d", "tab-detach", detach_current)
+mp.add_key_binding("c", "tab-clear-all", clear_all)
+-- j/k move between tabs the way they move the selection in the menu.
+mp.add_key_binding("j", "tab-next-j", function() cycle(1) end)
+mp.add_key_binding("k", "tab-prev-k", function() cycle(-1) end)
+for n = 1, 9 do
+    mp.add_key_binding(tostring(n), "tab-jump-" .. n, function()
+        if n <= playlist_count() then
+            mp.set_property_number("playlist-pos-1", n)
+        end
+    end)
+end
 
 -- Keep the menu fresh while optim appends.
 mp.observe_property("playlist-count", "number", function(_, count)

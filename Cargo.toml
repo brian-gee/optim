@@ -1,6 +1,6 @@
 [package]
 name = "optim"
-version = "0.8.1"
+version = "0.10.0"
 edition = "2021"
 description = "Minimal, fast, native app launcher for Windows"
 license = "MIT"

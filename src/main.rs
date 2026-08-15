@@ -5,8 +5,10 @@ mod config;
 mod font;
 mod watch;
 mod frecency;
+mod hidden;
 mod index;
 mod matcher;
+mod services;
 mod window;
 
 use windows::core::{w, Result};
@@ -54,6 +56,20 @@ fn set_autostart(enable: bool) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Watch-queue edits arrive as short-lived processes: mpv's tab menu shells
+    // out to these rather than writing the history itself, so optim stays the
+    // only writer. They must run before the single-instance check below.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--watch-forget") {
+        if let Some(target) = args.get(i + 1) {
+            watch::forget(target);
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--watch-clear") {
+        watch::clear();
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--install-autostart") {
         return set_autostart(true);
     }
@@ -95,6 +111,14 @@ fn main() -> Result<()> {
 
         let hwnd_val = _app.hwnd_val();
         std::thread::spawn(move || index::run_index(hwnd_val));
+
+        // The watch queue keeps every video until it's explicitly dropped;
+        // the startup sweep only collects files no history entry points at.
+        // Recording the exe path lets mpv's tab menu call back into optim.
+        std::thread::spawn(|| {
+            watch::record_exe_path();
+            watch::sweep();
+        });
 
         // Watch both Start Menu program folders so new apps appear live.
         for base in [

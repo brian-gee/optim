@@ -35,6 +35,23 @@ fn shutdown_exe(args: PCWSTR) {
     }
 }
 
+/// Modal yes/no, in front of whatever is on screen. Only for actions that
+/// delete the user's files — everything else in optim just happens.
+fn confirm(text: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO,
+    };
+    let text16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text16.as_ptr()),
+            w!("optim"),
+            MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND,
+        ) == IDYES
+    }
+}
+
 /// True while the focused window is fullscreen on its own monitor.
 /// Geometric and per-window, so a game fullscreen on one monitor doesn't
 /// block the popup while you're focused on another, and system DND state
@@ -78,8 +95,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, DestroyWindow, LoadIconW, TrackPopupMenu,
-    IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_RBUTTONUP,
+    IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_RBUTTONUP,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::DataExchange::{
@@ -127,6 +144,9 @@ const CMD_RELOAD_CONFIG: usize = 2;
 const CMD_REFRESH_APPS: usize = 3;
 const CMD_EXIT: usize = 4;
 const CMD_GAME_MODE: usize = 5;
+const CMD_UNHIDE_ALL: usize = 6;
+/// One id per hidden app in the tray submenu; offset well clear of the fixed ids.
+const CMD_UNHIDE_BASE: usize = 1000;
 
 /// Actions reachable both from the tray menu and as typed commands.
 #[derive(Clone, Copy, PartialEq)]
@@ -141,15 +161,34 @@ enum Action {
     Lock,
     SignOut,
     ToggleGameMode,
+    UnhideAll,
+    WatchHistory,
+    ClearWatchHistory,
+    WatchFolder,
+    /// Index into `services::SERVICES`.
+    Service(usize),
 }
 
 /// Typed commands: (display name, extra match keywords, action).
 /// Keywords let "exit"/"settings"/"reboot" find their commands too.
-const COMMANDS: [(&str, &str, Action); 10] = [
+const COMMANDS: [(&str, &str, Action); 21] = [
+    ("optim: Watch Queue Folder", "optim watch queue folder cache downloads explorer open temp", Action::WatchFolder),
+    // Background tools with no tray icon of their own. Names lead with the
+    // tool so typing "komorebi" lists everything you can do to it.
+    ("komorebi: Start", "komorebi start tiling window manager wm whkd", Action::Service(0)),
+    ("komorebi: Stop", "komorebi stop quit kill tiling window manager wm whkd", Action::Service(1)),
+    ("komorebi: Restart", "komorebi restart reboot tiling window manager wm whkd", Action::Service(2)),
+    ("komorebi: Reload Config", "komorebi reload config json apply replace configuration", Action::Service(3)),
+    ("komorebi: Toggle Pause", "komorebi toggle pause resume tiling suspend", Action::Service(4)),
+    ("komorebi: Retile", "komorebi retile relayout refresh layout windows", Action::Service(5)),
+    ("whkd: Restart", "whkd restart hotkeys keybinds daemon reload whkdrc", Action::Service(6)),
     ("optim: Open Config", "optim open config settings edit", Action::OpenConfig),
+    ("optim: Watch Queue", "optim watch queue history videos playlist mpv player tabs open", Action::WatchHistory),
+    ("optim: Clear Watch Queue", "optim clear watch queue history videos delete downloads temp forget", Action::ClearWatchHistory),
     ("optim: Reload Config", "optim reload config settings", Action::ReloadConfig),
     ("optim: Refresh Apps", "optim refresh apps index rescan", Action::RefreshApps),
     ("optim: Game Mode", "optim game mode gaming toggle block", Action::ToggleGameMode),
+    ("optim: Unhide All Apps", "optim unhide all apps hidden show restore", Action::UnhideAll),
     ("optim: Quit", "optim quit exit close", Action::Quit),
     ("Restart", "restart reboot system power", Action::Restart),
     ("Shut Down", "shut down shutdown power off system", Action::Shutdown),
@@ -211,6 +250,15 @@ pub struct App {
     sel: usize,
     cfg: Config,
     frec: HashMap<String, u32>,
+    /// Apps kept out of the results: parsing key -> display name.
+    hidden: HashMap<String, String>,
+    /// Set when a keydown already consumed the keystroke, so the WM_CHAR that
+    /// TranslateMessage generates for it doesn't also land in the query.
+    /// Ctrl+H is why: it arrives as the ASCII backspace 0x08.
+    swallow_char: bool,
+    /// True while a popup menu is tracking, so the deactivation it causes
+    /// doesn't hide the window out from under the menu.
+    menu_open: bool,
     last_index: Instant,
     select_all: bool,
     forced_game_mode: bool,
@@ -252,6 +300,9 @@ impl App {
                 sel: 0,
                 cfg: config::load(),
                 frec: frecency::load(),
+                hidden: crate::hidden::load(),
+                swallow_char: false,
+                menu_open: false,
                 last_index: Instant::now(),
                 select_all: false,
                 forced_game_mode: false,
@@ -340,12 +391,38 @@ impl App {
                 MF_STRING
             };
             let _ = AppendMenuW(menu, game_flags, CMD_GAME_MODE, w!("Game Mode"));
+
+            // Hidden apps: one entry each, click to unhide. Owned up front so
+            // the ids stay valid once the borrow of `self.hidden` is over.
+            let hidden_list = crate::hidden::sorted(&self.hidden);
+            if let Ok(sub) = CreatePopupMenu() {
+                if hidden_list.is_empty() {
+                    let _ = AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, w!("(none)"));
+                } else {
+                    for (i, (_, name)) in hidden_list.iter().enumerate() {
+                        // AppendMenuW copies the string, so the buffer is free to die here.
+                        let n16: Vec<u16> =
+                            name.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = AppendMenuW(
+                            sub,
+                            MF_STRING,
+                            CMD_UNHIDE_BASE + i,
+                            PCWSTR(n16.as_ptr()),
+                        );
+                    }
+                    let _ = AppendMenuW(sub, MF_SEPARATOR, 0, None);
+                    let _ = AppendMenuW(sub, MF_STRING, CMD_UNHIDE_ALL, w!("Unhide All"));
+                }
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Hidden Apps"));
+            }
+
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w!("Exit"));
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = SetForegroundWindow(self.hwnd); // so the menu dismisses on outside click
+            self.menu_open = true;
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -355,6 +432,7 @@ impl App {
                 self.hwnd,
                 None,
             );
+            self.menu_open = false;
             let _ = DestroyMenu(menu);
 
             match cmd.0 as usize {
@@ -362,7 +440,14 @@ impl App {
                 CMD_RELOAD_CONFIG => self.run_action(Action::ReloadConfig),
                 CMD_REFRESH_APPS => self.run_action(Action::RefreshApps),
                 CMD_GAME_MODE => self.run_action(Action::ToggleGameMode),
+                CMD_UNHIDE_ALL => self.run_action(Action::UnhideAll),
                 CMD_EXIT => self.run_action(Action::Quit),
+                c if c >= CMD_UNHIDE_BASE => {
+                    if let Some((key, _)) = hidden_list.get(c - CMD_UNHIDE_BASE) {
+                        crate::hidden::unhide(&mut self.hidden, key);
+                        self.update_matches();
+                    }
+                }
                 _ => {}
             }
         }
@@ -427,6 +512,44 @@ impl App {
                 }
                 Action::ToggleGameMode => {
                     self.forced_game_mode = !self.forced_game_mode;
+                }
+                Action::UnhideAll => {
+                    crate::hidden::clear(&mut self.hidden);
+                    self.update_matches();
+                }
+                Action::Service(i) => crate::services::start(i),
+                Action::WatchFolder => {
+                    let dir: Vec<u16> = std::env::temp_dir()
+                        .join("watchqueue")
+                        .to_string_lossy()
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    ShellExecuteW(
+                        None,
+                        w!("open"),
+                        PCWSTR(dir.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+                Action::WatchHistory => crate::watch::open_history(),
+                Action::ClearWatchHistory => {
+                    let (files, bytes) = crate::watch::stats();
+                    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    let msg = format!(
+                        "Clear the watch queue?\n\n\
+                         {files} file(s), {gib:.1} GB in {}.\n\n\
+                         Every tab and every downloaded file goes. This can't be undone.",
+                        std::env::temp_dir().join("watchqueue").display()
+                    );
+                    if confirm(&msg) {
+                        // Clearing waits on mpv releasing file handles.
+                        std::thread::spawn(|| {
+                            crate::watch::clear();
+                        });
+                    }
                 }
             }
         }
@@ -501,6 +624,7 @@ impl App {
                 .apps
                 .iter()
                 .enumerate()
+                .filter(|(_, a)| !self.hidden.contains_key(&a.key))
                 .filter_map(|(i, a)| {
                     matcher::score(&q, &a.name_lower).map(|s| {
                         let boost = self.frec.get(&a.name).copied().unwrap_or(0).min(10) * 4;
@@ -1095,6 +1219,10 @@ impl App {
     }
 
     fn on_char(&mut self, c: u16) {
+        // A keydown handler already acted on this keystroke (Ctrl+H).
+        if std::mem::take(&mut self.swallow_char) {
+            return;
+        }
         match c {
             0x08 => {
                 // Backspace (Ctrl+Backspace arrives as 0x7F on some layouts; handle both)
@@ -1141,41 +1269,19 @@ impl App {
             }
             0x56 if Self::ctrl_down() => self.paste_clipboard(), // Ctrl+V
             v if v == VK_RETURN.0 => {
-                let calc_rows = self.calc.is_some() as usize;
-                if self.calc.is_some() && self.sel == 0 {
-                    let text = self.calc.clone().unwrap();
-                    self.copy_to_clipboard(&text);
-                    self.hide();
-                } else {
-                    // Ctrl+Shift+Enter = run elevated.
-                    let admin = Self::ctrl_down() && Self::shift_down();
-                    match self.matches.get(self.sel - calc_rows) {
-                        Some(&Hit::App(idx)) => {
-                            if admin {
-                                crate::index::launch_admin(&self.apps[idx]);
-                            } else {
-                                launch(&self.apps[idx]);
-                            }
-                            let name = self.apps[idx].name.clone();
-                            frecency::bump(&mut self.frec, &name);
-                            self.hide();
-                        }
-                        Some(&Hit::Cmd(idx)) => {
-                            self.hide();
-                            self.run_action(COMMANDS[idx].2);
-                        }
-                        Some(&Hit::Term) => {
-                            self.run_in_terminal(admin);
-                            self.hide();
-                        }
-                        Some(&Hit::Watch) => {
-                            crate::watch::play(self.query.trim());
-                            self.hide();
-                        }
-                        None => {}
-                    }
-                }
+                // Ctrl+Shift+Enter = run elevated.
+                let admin = Self::ctrl_down() && Self::shift_down();
+                self.activate_selection(admin);
             }
+            // Hide the selected app from the list. Ctrl+H for the mnemonic;
+            // Shift+Delete because that's the reflex from browser address bars,
+            // where it means exactly this. Ctrl+H reaches WM_CHAR as 0x08
+            // (backspace), so the follow-up char has to be swallowed.
+            0x48 if Self::ctrl_down() => {
+                self.swallow_char = true;
+                self.hide_selected();
+            }
+            v if v == VK_DELETE.0 && Self::shift_down() => self.hide_selected(),
             v if v == VK_UP.0 => {
                 let n = self.total_rows();
                 if n > 0 {
@@ -1231,6 +1337,65 @@ impl App {
         }
     }
 
+    /// Runs whatever the selected row is. Shared by Enter and left-click so
+    /// the mouse can never drift from what the keyboard does.
+    fn activate_selection(&mut self, admin: bool) {
+        let calc_rows = self.calc.is_some() as usize;
+        if self.calc.is_some() && self.sel == 0 {
+            let text = self.calc.clone().unwrap();
+            self.copy_to_clipboard(&text);
+            self.hide();
+            return;
+        }
+        match self.matches.get(self.sel - calc_rows) {
+            Some(&Hit::App(idx)) => {
+                if admin {
+                    crate::index::launch_admin(&self.apps[idx]);
+                } else {
+                    launch(&self.apps[idx]);
+                }
+                let name = self.apps[idx].name.clone();
+                frecency::bump(&mut self.frec, &name);
+                self.hide();
+            }
+            Some(&Hit::Cmd(idx)) => {
+                self.hide();
+                self.run_action(COMMANDS[idx].2);
+            }
+            Some(&Hit::Term) => {
+                self.run_in_terminal(admin);
+                self.hide();
+            }
+            Some(&Hit::Watch) => {
+                crate::watch::play(self.query.trim());
+                self.hide();
+            }
+            None => {}
+        }
+    }
+
+    /// The app on the selected row, if that row is an app at all. The calc
+    /// result, commands, `>` and watch rows aren't index entries, so there is
+    /// nothing to hide for them.
+    fn selected_app(&self) -> Option<usize> {
+        let calc_rows = self.calc.is_some() as usize;
+        let row = self.sel.checked_sub(calc_rows)?;
+        match self.matches.get(row)? {
+            &Hit::App(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Drops the selected app out of the results and remembers that across
+    /// restarts. Re-filters straight away so the row disappears under the
+    /// cursor rather than on the next keystroke.
+    fn hide_selected(&mut self) {
+        let Some(idx) = self.selected_app() else { return };
+        let (key, name) = (self.apps[idx].key.clone(), self.apps[idx].name.clone());
+        crate::hidden::hide(&mut self.hidden, &key, &name);
+        self.update_matches();
+    }
+
     fn handle(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         unsafe {
             match msg {
@@ -1265,7 +1430,9 @@ impl App {
                     LRESULT(0)
                 }
                 WM_ACTIVATE => {
-                    if (wparam.0 as u32 & 0xFFFF) == 0 && self.is_visible() {
+                    // menu_open: TrackPopupMenu's deactivation must not pull
+                    // the window out from under its own menu.
+                    if (wparam.0 as u32 & 0xFFFF) == 0 && self.is_visible() && !self.menu_open {
                         self.hide();
                     }
                     LRESULT(0)
@@ -1338,3 +1505,4 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         (*app).handle(hwnd, msg, wparam, lparam)
     }
 }
+
