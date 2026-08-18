@@ -171,7 +171,7 @@ enum Action {
 
 /// Typed commands: (display name, extra match keywords, action).
 /// Keywords let "exit"/"settings"/"reboot" find their commands too.
-const COMMANDS: [(&str, &str, Action); 21] = [
+const COMMANDS: [(&str, &str, Action); 24] = [
     ("optim: Watch Queue Folder", "optim watch queue folder cache downloads explorer open temp", Action::WatchFolder),
     // Background tools with no tray icon of their own. Names lead with the
     // tool so typing "komorebi" lists everything you can do to it.
@@ -182,6 +182,11 @@ const COMMANDS: [(&str, &str, Action); 21] = [
     ("komorebi: Toggle Pause", "komorebi toggle pause resume tiling suspend", Action::Service(4)),
     ("komorebi: Retile", "komorebi retile relayout refresh layout windows", Action::Service(5)),
     ("whkd: Restart", "whkd restart hotkeys keybinds daemon reload whkdrc", Action::Service(6)),
+    // The bar hides explorer's taskbar and hosts the tray, so once it exits
+    // there is no bar left to restart it from. This is that way back.
+    ("optim-bar: Start", "optim bar start launch taskbar status shell tray", Action::Service(7)),
+    ("optim-bar: Restart", "optim bar restart reload rebuild taskbar status shell tray", Action::Service(8)),
+    ("optim-bar: Stop (restore taskbar)", "optim bar stop quit exit kill restore explorer taskbar shell tray", Action::Service(9)),
     ("optim: Open Config", "optim open config settings edit", Action::OpenConfig),
     ("optim: Watch Queue", "optim watch queue history videos playlist mpv player tabs open", Action::WatchHistory),
     ("optim: Clear Watch Queue", "optim clear watch queue history videos delete downloads temp forget", Action::ClearWatchHistory),

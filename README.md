@@ -26,6 +26,13 @@ no plugins — a single exe that idles around 11 MB.
   config in place, so windows keep their workspaces; the config path comes from
   komorebi's own lookup (`KOMOREBI_CONFIG_HOME`, else the user profile) rather
   than anything baked in.
+  `optim-bar: Start` / `Restart` / `Stop (restore taskbar)` are there for the
+  same reason, only more so: the bar hides explorer's taskbar and hosts the
+  tray, so its own Exit is the first thing to disappear when it goes. `Restart`
+  waits for the old process to release its single-instance mutex before
+  starting the new one, and `Stop` hands the shell back to explorer. The bar is
+  located through the `Run` entry it registers for itself, falling back to
+  `PATH`.
 - System commands: `Restart`, `Shut Down`, `Sleep`, `Lock`, `Sign Out`
 - `>ipconfig` runs a shell command in Windows Terminal (falls back to cmd)
 - Paste a video URL → **watch in mpv**: the file downloads to `%TEMP%\watchqueue`
